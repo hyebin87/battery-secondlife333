@@ -36,20 +36,35 @@ st.markdown("""
 
 # ─────────────────────────────────────────────
 # 배터리 특성값
-# SOH 기준: PMC11033388
-#   > 80%      → 재사용 (Reuse)
-#   50% ~ 80%  → 재활용 (Repurpose)
-#   ≤ 50%      → 해체 (Recycle)
-# LFP 2차 수명: chrismi.sdsu.edu/publications/225.pdf
+#
+# [SOH 3단계 기준] PMC11033388
+#   > 80%     → 재사용 (Reuse)
+#   50~80%    → 재활용 (Repurpose)
+#   <= 50%    → 해체 (Recycle)
+#
+# [사이클 수명 / 캘린더 열화율] Ali et al. (2023), Section 2 p.2 & Section 3
+#   LFP  사이클 수명: 4,000회 이상
+#   NCM  사이클 수명: 2,000회
+#   NCA  사이클 수명: 1,500회
+#   LFP  캘린더 열화율: 1%/년 미만
+#   NCM/NCA 캘린더 열화율: ~2%/년
+#   LCO  캘린더 열화율: ~3%/년
+#
+# [LFP 2차 수명] chrismi.sdsu.edu/publications/225.pdf
 # ─────────────────────────────────────────────
 BAT_PROPS = {
-    "NCM": dict(cycle_life=2000, nominal_v=3.6),
+    # calendar_aging_rate_pct: 연간 SOH 감소율 (%, Ali et al. 2023)
+    "NCM": dict(cycle_life=2000, nominal_v=3.6,
+                calendar_aging_rate_pct=2.0),
     "LFP": dict(cycle_life=4000, nominal_v=3.2,
+                calendar_aging_rate_pct=1.0,
                 eis_threshold=60,
                 second_life_cycles=(5000, 10000),
                 second_life_years=(14, 28)),
-    "NCA": dict(cycle_life=1500, nominal_v=3.6),
-    "LCO": dict(cycle_life=800,  nominal_v=3.7),
+    "NCA": dict(cycle_life=1500, nominal_v=3.6,
+                calendar_aging_rate_pct=2.0),
+    "LCO": dict(cycle_life=800,  nominal_v=3.7,
+                calendar_aging_rate_pct=3.0),
 }
 
 def get_soh_tier(soh):
@@ -335,20 +350,27 @@ def extract_bms_features_from_csv(df):
 def get_recommendations(health, years, cycles, bat_type, voltage):
     """
     활용처 추천 적합도 계산
-    [근거] PMC11033388, IEC 62933
+    ─────────────────────────────────────────────
+    [근거] PMC11033388, IEC 62933, Ali et al. (2023)
 
-    적합도 기준:
-    - SOH가 핵심 지표 (base = health)
-    - 사이클 페널티는 최대 10점으로 상한 제한
-      (사이클 초과가 SOH 실측값보다 판정을 더 크게 바꾸면 안 됨)
-    - 전압 이탈 페널티: 공칭 전압 ±0.3V 초과 시만 적용
+    적합도 base 점수 구성:
+    1. SOH (핵심 지표, 100점 만점 기준)
+    2. 사이클 페널티: 최대 10점 상한
+       (사이클 초과가 SOH 실측값 판정을 역전하지 않도록)
+    3. 캘린더 열화 페널티: 연수 × 열화율 (Ali et al. 2023)
+       LFP <1%/년, NCM/NCA ~2%/년, LCO ~3%/년 — 최대 10점 상한
+    4. 전압 이탈 페널티: 공칭 전압 ±0.3V 초과 시만 적용
+    ─────────────────────────────────────────────
     """
     props         = BAT_PROPS[bat_type]
     cycle_ratio   = cycles / props['cycle_life']
-    # 사이클 페널티 최대 10점 상한 (SOH 판정을 역전하지 않도록)
+    cal_rate      = props.get('calendar_aging_rate_pct', 2.0)  # Ali et al. (2023)
+
+    # 페널티 계산 (모두 최대 10점 상한)
     cycle_penalty = min(cycle_ratio * 10, 10)
-    age_penalty   = min(years * 1, 10)          # 연수 페널티도 최대 10점
-    base          = health - cycle_penalty - age_penalty
+    # 캘린더 열화 페널티: 누적 열화량 기반, 최대 10점
+    cal_penalty   = min(years * cal_rate, 10)
+    base          = health - cycle_penalty - cal_penalty
     v_diff        = abs(voltage - props['nominal_v'])
     if v_diff > 0.3: base -= v_diff * 10
     tier          = get_soh_tier(health)
@@ -387,26 +409,44 @@ def get_recommendations(health, years, cycles, bat_type, voltage):
 
 def safety_eval(health, years, cycles, bat_type, voltage):
     """
-    안전성 판정 — SOH가 1차 기준, 사이클/연수는 보조 경고만
-    [근거 1] SOH 3단계: PMC11033388
-    [근거 2] 사이클 수명 정의: Frontiers in Energy Research (2023)
-             cycle_life = SOH 100→80% 도달 사이클 수
-             사이클 초과 != 즉시 폐기. SOH 실측 80% 이상이면 재사용 가능.
-    [근거 3] LFP 임피던스: PMC11033388 (SOH 60% 미만 급증)
+    안전성 판정
+    ─────────────────────────────────────────────
+    [1차 기준] SOH — PMC11033388
+      > 80%    → 재사용 / 50~80% → 재활용 / ≤50% → 해체
+
+    [보조 경고] 사이클 & 캘린더 열화 — Ali et al. (2023)
+      - 사이클 수명: LFP 4,000회 / NCM 2,000회 / NCA 1,500회
+      - 캘린더 열화율: LFP <1%/년, NCM/NCA ~2%/년, LCO ~3%/년
+      - 초과 시 판정 등급 강등 없이 경고 메시지만 표시
+
+    [LFP 임피던스] PMC11033388 — SOH 60% 미만 급증
+    ─────────────────────────────────────────────
     """
-    props       = BAT_PROPS[bat_type]
-    cycle_ratio = cycles / props['cycle_life']
-    tier        = get_soh_tier(health)
+    props        = BAT_PROPS[bat_type]
+    cycle_ratio  = cycles / props['cycle_life']
+    cal_rate     = props.get('calendar_aging_rate_pct', 2.0)  # Ali et al. (2023)
+    # 캘린더 열화 예상 SOH 감소량 (연수 × 연간 열화율)
+    cal_loss     = years * cal_rate
+    tier         = get_soh_tier(health)
 
     # 보조 경고 (판정 등급을 바꾸지 않음)
     warnings = []
     if cycle_ratio > 1.0:
         warnings.append(
             f"⚠️ 설계 사이클 수명 초과 ({cycles}회 / 기준 {props['cycle_life']}회)"
-            f" — 집중 모니터링 권장 (Frontiers in Energy Research, 2023)"
+            f" — 집중 모니터링 권장 (Ali et al. 2023; Frontiers in Energy Research, 2023)"
         )
     elif cycle_ratio > 0.75:
-        warnings.append(f"⚠️ 사이클 수명 {round(cycle_ratio*100)}% 소모 — 주기적 점검 권장")
+        warnings.append(
+            f"⚠️ 사이클 수명 {round(cycle_ratio*100)}% 소모"
+            f" — 주기적 점검 권장 (Ali et al. 2023)"
+        )
+    # 캘린더 열화 경고: 예상 누적 손실이 10% 초과 시
+    if cal_loss >= 10:
+        warnings.append(
+            f"⚠️ 캘린더 열화 누적 약 {cal_loss:.0f}% 예상"
+            f" ({bat_type} {cal_rate}%/년 × {years}년, Ali et al. 2023)"
+        )
     if bat_type == "LFP":
         thr = props.get('eis_threshold', 60)
         if health < thr:
