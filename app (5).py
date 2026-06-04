@@ -964,13 +964,12 @@ if method == "⚡ EIS 기반 예측":
 elif method == "📟 BMS 기반 예측":
     st.markdown("### 📟 BMS 데이터 입력")
     st.caption(
-        "NASA PCoE Battery Dataset 기반 모델 (B0005~B0018, LiCoO2 18650) | "
-        "출처: ti.arc.nasa.gov/tech/dash/groups/pcoe/"
+        "BMS 데이터 기반 SOH 예측 — 배터리 종류·사이클·내부저항 입력"
     )
 
     bms_input_mode = st.radio(
         "입력 방식",
-        ["📂 NASA .mat 업로드 (B0005~B0018)",
+        ["📂 .mat 파일 업로드 (MATLAB 형식)",
          "📁 CSV 파일 업로드 (BMS 로그)",
          "🎛️ 수동 입력 (슬라이더)"],
         horizontal=True
@@ -979,12 +978,12 @@ elif method == "📟 BMS 기반 예측":
     features_dict = None
 
     # ── NASA .mat 업로드 ────────────────────────
-    if bms_input_mode == "📂 NASA .mat 업로드 (B0005~B0018)":
-        st.caption("NASA PCoE B0005~B0018 .mat 파일을 바로 업로드 → 최신 사이클 기준 SOH 예측")
+    if bms_input_mode == "📂 .mat 파일 업로드 (MATLAB 형식)":
+        st.caption("MATLAB .mat 형식의 BMS 데이터 파일 업로드 → 최신 사이클 기준 SOH 예측")
 
         mat_bms_file = st.file_uploader(
-            "NASA .mat 파일 업로드", type=['mat'],
-            help="B0005.mat / B0006.mat / B0007.mat / B0018.mat"
+            ".mat 파일 업로드 (MATLAB 형식)", type=['mat'],
+            help="MATLAB .mat 형식 BMS 데이터 파일"
         )
         if mat_bms_file:
             with st.spinner("📂 .mat 파싱 중..."):
@@ -1051,9 +1050,20 @@ elif method == "📟 BMS 기반 예측":
 
     # ── CSV 업로드 ──────────────────────────────
     elif bms_input_mode == "📁 CSV 파일 업로드 (BMS 로그)":
-        st.markdown("**CSV 컬럼 형식:** `cycle, voltage, current, temperature, capacity, time_s`")
+        st.markdown("**CSV 컬럼 형식** — 아래 이름을 권장하지만 유사한 이름도 자동 감지합니다.")
 
-        with st.expander("📄 샘플 CSV 형식 보기"):
+        with st.expander("📄 권장 CSV 컬럼 형식 보기"):
+            st.markdown("""
+| 컬럼명 | 자동 감지 키워드 | 단위 |
+|---|---|---|
+| `cycle` | cycle, 사이클, cyc | 정수 |
+| `voltage` | voltage, volt, v, 전압 | V |
+| `current` | current, amp, i, 전류 | A |
+| `temperature` | temperature, temp, t, 온도 | °C |
+| `time_s` | time, t, 시간 | s |
+
+> 컬럼명이 달라도 위 키워드가 포함되면 자동 매핑됩니다.
+            """)
             sample = pd.DataFrame({
                 'cycle':       [1,1,1,2,2,2],
                 'voltage':     [3.2,3.18,3.15,3.19,3.17,3.14],
@@ -1063,18 +1073,38 @@ elif method == "📟 BMS 기반 예측":
                 'time_s':      [0,1800,3600,0,1800,3600],
             })
             st.dataframe(sample, use_container_width=True)
-            csv_sample = sample.to_csv(index=False)
-            st.download_button("⬇️ 샘플 CSV 다운로드", csv_sample,
+            st.download_button("⬇️ 샘플 CSV 다운로드",
+                               sample.to_csv(index=False),
                                "bms_sample.csv", "text/csv")
 
         bms_file = st.file_uploader("BMS 로그 CSV 업로드", type=['csv'])
         if bms_file:
             try:
                 df_bms = pd.read_csv(bms_file)
-                required = {'cycle','voltage','current','temperature','time_s'}
-                if not required.issubset(df_bms.columns):
-                    st.error(f"필수 컬럼 누락: {required - set(df_bms.columns)}")
+                # 컬럼명 자동 매핑 (다양한 BMS 장비 포맷 대응)
+                col_map = {}
+                for col in df_bms.columns:
+                    cl = col.lower()
+                    if any(k in cl for k in ['cycle','cyc','사이클']):
+                        col_map['cycle'] = col
+                    elif any(k in cl for k in ['voltage','volt','전압']) and 'col_map' not in str(col_map.get('voltage','')):
+                        col_map['voltage'] = col
+                    elif any(k in cl for k in ['current','amp','전류']):
+                        col_map['current'] = col
+                    elif any(k in cl for k in ['temp','온도']):
+                        col_map['temperature'] = col
+                    elif any(k in cl for k in ['time','시간']):
+                        col_map['time_s'] = col
+
+                missing = {'cycle','voltage','current','temperature','time_s'} - set(col_map.keys())
+                if missing:
+                    st.error(f"필수 컬럼을 찾지 못했습니다: {missing}")
+                    st.info(f"감지된 컬럼: {list(df_bms.columns)}")
                 else:
+                    # 표준 컬럼명으로 리네임
+                    df_bms = df_bms.rename(columns={v:k for k,v in col_map.items()})
+                    if col_map:
+                        st.caption(f"📌 컬럼 자동 매핑: {col_map}")
                     feat_list = extract_bms_features_from_csv(df_bms, bat_type)
                     if not feat_list:
                         st.error("피처 추출 실패. 데이터를 확인해주세요.")
@@ -1113,7 +1143,7 @@ elif method == "📟 BMS 기반 예측":
             f"💡 **{bat_type} 기준값** — "
             f"설계 사이클 수명 {props_now['cycle_life']:,}회, "
             f"신품 내부저항 {r_ref['r0']}Ω, "
-            f"말기 내부저항 {r_ref['r_max']}Ω (Ali et al. 2023; NASA PCoE)"
+            f"말기 내부저항 {r_ref['r_max']}Ω (Ali et al. 2023)"
         )
         c1, c2 = st.columns(2)
         # ── 핵심 3개 입력만 받고 나머지는 자동 계산 ──────────
@@ -1144,7 +1174,7 @@ elif method == "📟 BMS 기반 예측":
                 f"내부 저항 (Ω) | 신품 {r_ref['r0']} → 말기 {r_ref['r_max']}",
                 float(r_ref['r0']), float(r_ref['r_max'] * 1.5),
                 float(auto_r_input), step=0.005,
-                help="사이클 수 기준 자동 계산값. BMS 실측값이 있으면 직접 입력 (NASA PCoE)"
+                help="사이클 수 기준 자동 계산값. BMS 실측값이 있으면 직접 입력"
             )
 
         st.caption(
@@ -1179,7 +1209,7 @@ elif method == "📟 BMS 기반 예측":
 | 배터리 종류 | {fd['bat_type']} | 선택값 |
 | 사이클 수 | {fd['cycle']:.0f}회 | 사용자 입력 |
 | 사용 연수 | {fd['years']:.1f}년 | 사용자 입력 |
-| 내부 저항 | {fd['int_r']:.4f} Ω | 사용자 입력 (NASA PCoE) |
+| 내부 저항 | {fd['int_r']:.4f} Ω | 사용자 입력 |
 | 이론 SOH (사이클+캘린더) | {soh_theory:.1f}% | Ali et al. (2023) |
 | 자동계산 충전시간 | {feats_auto[3]:.0f} s | 물리 모델 역산 |
 | 자동계산 온도 상승폭 | {feats_auto[4]:.1f} °C | 물리 모델 역산 |
@@ -1191,7 +1221,7 @@ elif method == "📟 BMS 기반 예측":
             bms_models,
             fd['bat_type'], fd['cycle'], fd['years'], fd['int_r']
         )
-        render_result(soh, "BMS ML 예측 (NASA PCoE 기반, 앙상블)", bat_type,
+        render_result(soh, "BMS ML 예측 (앙상블 모델)", bat_type,
                       years, cycles, voltage, "📟 BMS 기반")
 
 # ═══════════════════════════════════════
