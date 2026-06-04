@@ -321,12 +321,16 @@ def predict_soh_bms(models, features_dict):
     pred = (models['gb'].predict(Xs)[0] + models['rf'].predict(Xs)[0]) / 2
     return round(float(np.clip(pred, 50, 100)), 1)
 
-def extract_bms_features_from_csv(df):
+def extract_bms_features_from_csv(df, bat_type):
     """
-    BMS CSV 로그에서 피처 추출
-    CSV 컬럼: cycle, voltage, current, temperature, capacity
+    BMS CSV 로그에서 새 9-피처 구조로 추출
+    CSV 컬럼: cycle, voltage, current, temperature, time_s
+    피처: cycle_count, years, internal_resistance_ohm, charge_time_s,
+          temp_rise_c, voltage_drop_v, coulombic_efficiency, bat_type_enc, cycle_life
     """
     features_list = []
+    cl = BAT_PROPS[bat_type]['cycle_life']
+
     for cycle_id, grp in df.groupby('cycle'):
         try:
             charge_grp    = grp[grp['current'] > 0]
@@ -339,30 +343,25 @@ def extract_bms_features_from_csv(df):
             discharge_cap = (discharge_grp['current'].abs() *
                              discharge_grp['time_s'].diff().fillna(0)).sum() / 3600
             charge_time   = charge_grp['time_s'].max() - charge_grp['time_s'].min()
-            discharge_time= discharge_grp['time_s'].max() - discharge_grp['time_s'].min()
             voltage_drop  = charge_grp['voltage'].max() - charge_grp['voltage'].iloc[-1]
-            temp_max      = grp['temperature'].max()
             temp_rise     = grp['temperature'].max() - grp['temperature'].min()
-            # 내부 저항: ΔV/ΔI 순간값 추정
             dv = grp['voltage'].diff().abs().mean()
             di = grp['current'].diff().abs().mean()
-            internal_r    = dv / di if di > 0 else 0.15
+            internal_r    = float(dv / di) if di > 0 else BAT_RESISTANCE[bat_type]['r0']
             coulombic_eff = discharge_cap / charge_cap if charge_cap > 0 else 0.99
-            # 전압 평탄 구간: 전압 변화 작은 구간 시간 합산
-            flat_mask     = grp['voltage'].diff().abs() < 0.01
-            plateau_t     = flat_mask.sum()
+            # 사이클 → 연수 추정 (하루 1회 기준)
+            est_years     = float(cycle_id) / 365.0
 
             features_list.append({
-                'cycle_count':              float(cycle_id),
-                'discharge_capacity_ah':    float(discharge_cap),
-                'charge_time_s':            float(charge_time),
-                'discharge_time_s':         float(discharge_time),
-                'voltage_drop_v':           float(voltage_drop),
-                'temp_max_c':               float(temp_max),
-                'temp_rise_c':              float(temp_rise),
-                'internal_resistance_ohm':  float(internal_r),
-                'coulombic_efficiency':     float(coulombic_eff),
-                'voltage_plateau_s':        float(plateau_t),
+                'cycle_count':             float(cycle_id),
+                'years':                   est_years,
+                'internal_resistance_ohm': float(np.clip(internal_r, 0.01, 1.0)),
+                'charge_time_s':           float(charge_time),
+                'temp_rise_c':             float(temp_rise),
+                'voltage_drop_v':          float(voltage_drop),
+                'coulombic_efficiency':    float(np.clip(coulombic_eff, 0.8, 1.0)),
+                'bat_type_enc':            float(BAT_ENC[bat_type]),
+                'cycle_life':              float(cl),
             })
         except:
             continue
@@ -613,7 +612,8 @@ with st.sidebar:
     st.markdown("### 📋 배터리 기본 정보")
     bat_type = st.selectbox("배터리 종류", ["LFP", "NCM", "NCA", "LCO"])
     years    = st.slider("사용 연수 (년)", 0, 15, 0)
-    cycles   = st.slider("충방전 횟수", 0, 5000, 0, 100)
+    cycles   = st.slider("충방전 횟수", 0, 10000, 0, 100,
+                     help="NCM 2,000 / LFP 4,000 / NCA 1,500 / LCO 800회가 설계 수명 기준 (Ali et al. 2023)")
     voltage  = st.number_input("현재 전압 (V)", 2.0, 4.3, 3.2, step=0.1)
 
     st.divider()
@@ -764,7 +764,7 @@ elif method == "📟 BMS 기반 예측":
                 if not required.issubset(df_bms.columns):
                     st.error(f"필수 컬럼 누락: {required - set(df_bms.columns)}")
                 else:
-                    feat_list = extract_bms_features_from_csv(df_bms)
+                    feat_list = extract_bms_features_from_csv(df_bms, bat_type)
                     if not feat_list:
                         st.error("피처 추출 실패. 데이터를 확인해주세요.")
                     else:
@@ -772,17 +772,17 @@ elif method == "📟 BMS 기반 예측":
                         features_dict = feat_list[-1]
                         st.success(f"✅ {len(feat_list)}개 사이클 데이터 추출 완료 — 최신 사이클 기준 예측")
 
-                        # 사이클별 방전 용량 트렌드 시각화
-                        cap_trend = [f['discharge_capacity_ah'] for f in feat_list]
+                        # 사이클별 내부 저항 트렌드 시각화 (노화 지표)
+                        r_trend = [f['internal_resistance_ohm'] for f in feat_list]
                         fig_trend = go.Figure()
                         fig_trend.add_trace(go.Scatter(
-                            y=cap_trend, mode='lines+markers',
-                            line=dict(color='#00d4aa', width=2),
-                            marker=dict(size=5), name='방전 용량'
+                            y=r_trend, mode='lines+markers',
+                            line=dict(color='#f0a500', width=2),
+                            marker=dict(size=5), name='내부 저항'
                         ))
                         fig_trend.update_layout(
-                            title="사이클별 방전 용량 추이 (Ah)",
-                            xaxis_title="사이클", yaxis_title="방전 용량 (Ah)",
+                            title="사이클별 내부 저항 추이 (Ω) — 노화 지표",
+                            xaxis_title="사이클", yaxis_title="내부 저항 (Ω)",
                             template='plotly_dark', height=280,
                             margin=dict(l=0,r=0,t=40,b=0)
                         )
@@ -792,38 +792,57 @@ elif method == "📟 BMS 기반 예측":
 
     # ── 수동 입력 ───────────────────────────────
     else:
-        st.markdown("**각 측정값을 직접 입력하세요**")
+        props_now = BAT_PROPS[bat_type]
+        r_ref     = BAT_RESISTANCE[bat_type]
+        st.caption(
+            f"💡 **{bat_type} 기준값** — "
+            f"설계 사이클 수명 {props_now['cycle_life']:,}회, "
+            f"신품 내부저항 {r_ref['r0']}Ω, "
+            f"말기 내부저항 {r_ref['r_max']}Ω (Ali et al. 2023; NASA PCoE)"
+        )
         c1, c2 = st.columns(2)
         with c1:
-            cycle_cnt   = st.number_input("사이클 수",              0.0, 5000.0, float(cycles), step=10.0)
-            dis_cap     = st.number_input("방전 용량 (Ah)",         0.1,    5.0,           1.8, step=0.01,
-                                          help="최근 완전 방전 시 측정 용량")
-            charge_t    = st.number_input("충전 시간 (s)",         600.0, 7200.0,        3600.0, step=60.0,
-                                          help="완충까지 소요 시간")
-            discharge_t = st.number_input("방전 시간 (s)",         600.0, 7200.0,        3500.0, step=60.0)
-            temp_max_v  = st.number_input("최대 온도 (°C)",         20.0,   60.0,          30.0, step=0.5)
+            # 사이클: 배터리 종류별 수명 1.5배까지 입력 가능
+            max_cyc = float(props_now['cycle_life'] * 2)
+            cycle_cnt = st.number_input(
+                f"사이클 수 (설계 수명: {props_now['cycle_life']:,}회)",
+                0.0, max_cyc, float(cycles), step=10.0,
+                help=f"{bat_type} 설계 사이클 수명 기준 (Ali et al. 2023)"
+            )
+            charge_t = st.number_input(
+                "충전 시간 (s)", 600.0, 7200.0, 3600.0, step=60.0,
+                help="완충까지 소요 시간. 노화 시 증가"
+            )
+            temp_rise_v = st.number_input(
+                "온도 상승폭 (°C)", 0.0, 20.0, 5.0, step=0.5,
+                help="충방전 중 온도 상승폭. 노화 시 증가"
+            )
         with c2:
-            voltage_drop_v = st.number_input("전압 강하 (V)",       0.0,    0.5,          0.05, step=0.005,
-                                             help="충전 말기 전압 강하")
-            temp_rise_v    = st.number_input("온도 상승폭 (°C)",    0.0,   20.0,           5.0, step=0.5)
-            internal_r_v   = st.number_input("내부 저항 (Ω)",      0.01,    1.0,          0.15, step=0.005,
-                                             help="신품 LiCoO2 기준 ~0.15 Ω")
-            coulomb_eff    = st.slider("쿨롱 효율 (%)", 90, 100, 99, step=1,
-                                       help="방전 용량 / 충전 용량 × 100") / 100
-            plateau_t      = st.number_input("전압 평탄 구간 (s)",  0.0, 4000.0,        1800.0, step=50.0,
-                                             help="전압 변화가 작은 구간 누적 시간")
+            internal_r_v = st.number_input(
+                "내부 저항 (Ω)",
+                float(r_ref['r0']), float(r_ref['r_max'] * 1.5),
+                float(r_ref['r0']), step=0.005,
+                help=f"{bat_type} 신품 {r_ref['r0']}Ω → 말기 {r_ref['r_max']}Ω (NASA PCoE)"
+            )
+            voltage_drop_v = st.number_input(
+                "전압 강하 (V)", 0.0, 0.5, 0.05, step=0.005,
+                help="충전 말기 전압 강하. 노화 시 증가"
+            )
+            coulomb_eff = st.slider(
+                "쿨롱 효율 (%)", 90, 100, 99, step=1,
+                help="방전 용량 / 충전 용량 × 100. 노화 시 감소"
+            ) / 100
 
         features_dict = {
             'cycle_count':             float(cycle_cnt),
-            'discharge_capacity_ah':   float(dis_cap),
-            'charge_time_s':           float(charge_t),
-            'discharge_time_s':        float(discharge_t),
-            'voltage_drop_v':          float(voltage_drop_v),
-            'temp_max_c':              float(temp_max_v),
-            'temp_rise_c':             float(temp_rise_v),
+            'years':                   float(years),
             'internal_resistance_ohm': float(internal_r_v),
+            'charge_time_s':           float(charge_t),
+            'temp_rise_c':             float(temp_rise_v),
+            'voltage_drop_v':          float(voltage_drop_v),
             'coulombic_efficiency':    float(coulomb_eff),
-            'voltage_plateau_s':       float(plateau_t),
+            'bat_type_enc':            float(BAT_ENC[bat_type]),
+            'cycle_life':              float(props_now['cycle_life']),
         }
 
     # ── 예측 실행 ───────────────────────────────
@@ -835,11 +854,10 @@ elif method == "📟 BMS 기반 예측":
             feat_df = pd.DataFrame({
                 '항목':  BMS_FEATURE_LABELS,
                 '값':    [round(features_dict[c], 4) for c in BMS_FEATURE_COLS],
-                '설명':  ['누적 충방전 횟수', '방전 시 실제 용량',
-                          '완충 소요 시간', '완방 소요 시간',
-                          '충전 말기 전압 강하', '최대 도달 온도',
-                          '충방전 중 온도 상승폭', '내부 저항 (노화 지표)',
-                          '방전/충전 용량 비율', '전압 평탄 구간 시간']
+                '설명':  ['누적 충방전 횟수 (Ali et al. 2023 기준)', '실제 사용 연수',
+                          '내부 저항 — 노화 핵심 지표 (NASA PCoE)', '완충 소요 시간',
+                          '충방전 중 온도 상승폭', '충전 말기 전압 강하',
+                          '방전/충전 용량 비율', '배터리 종류 인코딩', '설계 사이클 수명']
             })
             st.dataframe(feat_df, use_container_width=True, hide_index=True)
 
