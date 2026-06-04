@@ -355,14 +355,27 @@ def build_bms_features(bat_type, cycle, years, int_r):
             float(BAT_ENC[bat_type]), float(cl)]
 
 
-def predict_soh_bms(models, bat_type, cycle, years, int_r):
+def predict_soh_bms(models, bat_type, cycle, years, int_r,
+                    charge_time_s=None, temp_rise_c=None,
+                    voltage_drop_v=None, coulombic_eff=None):
     """
-    핵심 3개 입력 → 피처 자동 계산 → SOH 예측 (앙상블)
-    입력: bat_type, cycle(사이클 수), years(연수), int_r(내부저항 Ω)
+    BMS 측정값 → SOH 예측 (앙상블)
+
+    실측 BMS 피처가 있으면 그대로 사용,
+    없으면 사이클+연수+내부저항으로 자동 계산
+    (수동 입력 / CSV 미제공 항목 대체)
     """
     feats = build_bms_features(bat_type, cycle, years, int_r)
-    Xs    = models['scaler'].transform([feats])
-    pred  = (models['gb'].predict(Xs)[0] + models['rf'].predict(Xs)[0]) / 2
+
+    # 실측 BMS 값이 있으면 자동계산값 덮어쓰기
+    # 피처 순서: [cycle, years, int_r, chg_t, t_rise, v_drop, c_eff, bat_enc, cl]
+    if charge_time_s   is not None: feats[3] = float(charge_time_s)
+    if temp_rise_c     is not None: feats[4] = float(temp_rise_c)
+    if voltage_drop_v  is not None: feats[5] = float(voltage_drop_v)
+    if coulombic_eff   is not None: feats[6] = float(coulombic_eff)
+
+    Xs   = models['scaler'].transform([feats])
+    pred = (models['gb'].predict(Xs)[0] + models['rf'].predict(Xs)[0]) / 2
     return round(float(np.clip(pred, 50, 100)), 1)
 
 def extract_bms_features_from_csv(df, bat_type):
@@ -754,7 +767,9 @@ def render_result(soh_final, soh_source, bat_type, years, cycles, voltage, mode_
     m1, m2, m3, m4 = st.columns(4)
     for col, val, label, color, note in zip(
         [m1, m2, m3, m4],
-        [f"{soh_final}%", f"{bat_type}", f"{cycles}회 / {years}년", tier_text],
+        [f"{soh_final}%", f"{bat_type}",
+         f"{int(cycles) if float(cycles)==int(float(cycles)) else round(float(cycles))}회 / {round(float(years),1)}년",
+         tier_text],
         ["SOH", "배터리 종류", "사이클 / 사용 연수", "판정 등급"],
         [soh_color, "#00d4aa", "#00d4aa", tier_color],
         [soh_source[:28]+"...", "화학 조성", "누적 사용 이력",
@@ -799,7 +814,8 @@ def render_result(soh_final, soh_source, bat_type, years, cycles, voltage, mode_
 
     # 최종 판단
     st.divider()
-    cycle_pct = round(cycles / BAT_PROPS[bat_type]['cycle_life'] * 100)
+    _cycles_display = float(cycles)
+    cycle_pct = round(_cycles_display / BAT_PROPS[bat_type]['cycle_life'] * 100)
     if tier == "recycle":
         fc, fm, fr = "#e05555", "❌ 재사용 불가 — 해체(Recycle) 공정 필요", "PMC11033388 (SOH ≤ 50%); IEC 62619"
     elif tier == "repurpose":
@@ -858,8 +874,10 @@ with st.sidebar:
     st.markdown("### 🔬 분석 방법 선택")
     method = st.radio(
         "",
-        ["⚡ EIS 기반 예측", "📟 BMS 기반 예측", "✏️ SOH 직접 입력"],
-        help="EIS: 임피던스 분석 (정밀) | BMS: 충방전 데이터 (현장 적용)"
+        ["⚡ EIS 기반 예측", "📟 BMS 기반 예측",
+         "✏️ SOH 직접 입력", "🏭 배치 처리 (기업용)"],
+        help="EIS: 임피던스 분석 (정밀) | BMS: 충방전 데이터 | "
+             "배치: 여러 배터리 일괄 분석 → 엑셀 다운로드"
     )
 
 with st.expander("ℹ️ SOH 판정 기준 (PMC11033388)", expanded=False):
@@ -1000,6 +1018,12 @@ elif method == "📟 BMS 기반 예측":
                 st.stop()
 
             st.success(f"✅ **{bat_name}** | 방전 사이클 {len(soh_records)}개 파싱 완료")
+            st.caption(
+                f"📌 사이드바 설정(사이클·연수)은 무시됩니다. "
+                f"파일에서 읽은 값 — "
+                f"방전 {last['discharge_idx']}회 / "
+                f"약 {round(last['discharge_idx']/365.0, 1)}년으로 자동 적용됩니다."
+            )
 
             # 최신 사이클 기준으로 SOH 예측
             last = soh_records[-1]
@@ -1012,7 +1036,7 @@ elif method == "📟 BMS 기반 예측":
                 cr_ratio = min(last['discharge_idx'] / cl_now, 1.3)
                 ir = r_ref_now['r0'] + (r_ref_now['r_max']-r_ref_now['r0'])*cr_ratio
 
-            est_years = last['discharge_idx'] / 365.0
+            est_years = round(last['discharge_idx'] / 365.0, 1)
 
             # 사이클별 SOH 열화 그래프
             df_mat_bms = pd.DataFrame(soh_records)
@@ -1112,10 +1136,15 @@ elif method == "📟 BMS 기반 예측":
                     else:
                         last = feat_list[-1]
                         features_dict = {
-                            'bat_type': bat_type,
-                            'cycle':    last['cycle_count'],
-                            'years':    last['years'],
-                            'int_r':    last['internal_resistance_ohm'],
+                            'bat_type':        bat_type,
+                            'cycle':           last['cycle_count'],
+                            'years':           last['years'],
+                            'int_r':           last['internal_resistance_ohm'],
+                            # 실측 BMS 피처 직접 전달
+                            'charge_time_s':   last.get('charge_time_s'),
+                            'temp_rise_c':     last.get('temp_rise_c'),
+                            'voltage_drop_v':  last.get('voltage_drop_v'),
+                            'coulombic_eff':   last.get('coulombic_efficiency'),
                         }
                         st.success(f"✅ {len(feat_list)}개 사이클 데이터 추출 완료 — 최신 사이클 기준 예측")
 
@@ -1217,63 +1246,33 @@ elif method == "📟 BMS 기반 예측":
 | 자동계산 전압 강하 | {feats_auto[5]:.4f} V | 물리 모델 역산 |
             """)
 
-        fd  = features_dict
+        fd = features_dict
 
-        # .mat 파일 업로드 시: 실측 SOH를 직접 사용하고 예측과 비교
+        # ── .mat 업로드: 실측 SOH로 바로 진단 (ML 예측 없음) ──
+        # 방전 용량이 직접 측정된 경우 ML 예측은 의미 없음
         if fd.get('soh_actual') is not None:
-            soh_actual = fd['soh_actual']
-            # ML 예측도 수행 (비교용)
-            soh_pred = predict_soh_bms(
-                bms_models,
-                fd['bat_type'], fd['cycle'], fd['years'], fd['int_r']
-            )
-            err       = soh_pred - soh_actual
-            err_color = "#00d4aa" if abs(err) <= 5 else "#f0a500" if abs(err) <= 10 else "#e05555"
-
-            st.markdown('<div class="section-title">📊 실측 vs 예측 SOH 비교</div>',
-                        unsafe_allow_html=True)
-            c1, c2, c3 = st.columns(3)
-            c1.markdown(f"""
-            <div class="metric-card">
-                <div class="metric-val" style="color:#00d4aa">{soh_actual:.1f}%</div>
-                <div class="metric-label">✅ 실측 SOH (진단 기준)</div>
-                <div class="ref-text">방전 용량 / 초기 용량 × 100 — 가장 정확</div>
-            </div>""", unsafe_allow_html=True)
-            c2.markdown(f"""
-            <div class="metric-card">
-                <div class="metric-val" style="color:#aaa">{soh_pred:.1f}%</div>
-                <div class="metric-label">ML 예측 SOH (참고용)</div>
-                <div class="ref-text">사이클·연수만으로 추정 — EIS 없을 때 사용</div>
-            </div>""", unsafe_allow_html=True)
-            c3.markdown(f"""
-            <div class="metric-card">
-                <div class="metric-val" style="color:{err_color}">{err:+.1f}%</div>
-                <div class="metric-label">예측 오차</div>
-                <div class="ref-text">충방전 속도·온도 조건 차이로 오차 발생 가능</div>
-            </div>""", unsafe_allow_html=True)
-
-            # 오차가 클 때 원인 설명
-            if abs(err) > 10:
-                st.warning(
-                    f"⚠️ **ML 예측 오차 {err:+.1f}%** — "
-                    f"사이클 수만으로는 충방전 속도(C-rate)·온도 등 사용 조건을 알 수 없어 "
-                    f"오차가 발생합니다. "
-                    f"**진단은 실측 SOH({soh_actual:.1f}%) 기준으로 수행됩니다.**"
-                )
-            st.divider()
-
-            # 진단은 실측 SOH 기준으로 수행 (더 정확)
-            soh       = soh_actual
-            soh_label = "실측 SOH (방전 용량 기반)"
+            soh       = fd['soh_actual']
+            soh_label = "실측 SOH (방전 용량 / 초기 용량 × 100)"
             use_cycle = fd['cycle']
             use_years = fd['years']
+
+        # ── CSV / 수동 입력: 실측 방전 용량 없음 → ML로 추정 ──
+        # BMS 측정값(내부저항·충전시간·온도·전압강하)을 피처로 사용
         else:
-            # 수동입력 / CSV: ML 예측값 사용
             soh = predict_soh_bms(
                 bms_models,
-                fd['bat_type'], fd['cycle'], fd['years'], fd['int_r']
+                fd['bat_type'], fd['cycle'], fd['years'], fd['int_r'],
+                charge_time_s  = fd.get('charge_time_s'),
+                temp_rise_c    = fd.get('temp_rise_c'),
+                voltage_drop_v = fd.get('voltage_drop_v'),
+                coulombic_eff  = fd.get('coulombic_eff'),
             )
-            soh_label = "BMS ML 예측 (앙상블 모델)"
+            used_actual = [k for k in ['charge_time_s','temp_rise_c',
+                           'voltage_drop_v','coulombic_eff'] if fd.get(k) is not None]
+            if used_actual:
+                soh_label = f"BMS ML 예측 (실측 피처 반영: {', '.join(used_actual)})"
+            else:
+                soh_label = "BMS ML 예측 (사이클·연수·내부저항 기반)"
             use_cycle = fd['cycle']
             use_years = fd['years']
 
@@ -1289,3 +1288,264 @@ elif method == "✏️ SOH 직접 입력":
     if st.button("📊 분석 실행", type="primary"):
         render_result(soh_direct, "직접 입력 (IEC 62660-1 기준)", bat_type,
                       years, cycles, voltage, "✏️ 직접 입력")
+
+
+# ═══════════════════════════════════════
+elif method == "🏭 배치 처리 (기업용)":
+    st.markdown("### 🏭 배치 처리 — 여러 배터리 일괄 분석")
+    st.caption(
+        "여러 배터리의 .mat 또는 CSV 파일을 한번에 업로드 → "
+        "SOH 자동 계산 → 재사용/재활용/해체 판정 → 엑셀 다운로드"
+    )
+
+    # ── 입력 방식 선택 ────────────────────────
+    batch_mode = st.radio(
+        "파일 형식",
+        ["📂 .mat 파일 (MATLAB 형식)", "📁 CSV 파일 (BMS 로그)"],
+        horizontal=True
+    )
+
+    if batch_mode == "📂 .mat 파일 (MATLAB 형식)":
+        st.caption("각 파일 = 배터리 1개. 최신 사이클 기준 SOH 자동 계산.")
+        batch_files = st.file_uploader(
+            ".mat 파일 업로드 (여러 개 동시 가능)",
+            type=['mat'], accept_multiple_files=True
+        )
+    else:
+        st.caption(
+            "각 파일 = 배터리 1개. capacity 컬럼 있으면 실측 SOH, "
+            "없으면 ML 추정."
+        )
+        batch_files = st.file_uploader(
+            "CSV 파일 업로드 (여러 개 동시 가능)",
+            type=['csv'], accept_multiple_files=True
+        )
+
+    # ── 배터리 종류 공통 설정 ─────────────────
+    col_opt1, col_opt2 = st.columns(2)
+    with col_opt1:
+        batch_bat_type = st.selectbox(
+            "배터리 종류 (전체 공통 적용)",
+            ["LFP", "NCM", "NCA", "LCO"],
+            help="모든 파일에 동일하게 적용됩니다."
+        )
+    with col_opt2:
+        batch_voltage = st.number_input(
+            "공칭 전압 (V)", 2.0, 4.3,
+            float(BAT_PROPS[batch_bat_type]['nominal_v']),
+            step=0.1
+        )
+
+    if batch_files:
+        st.divider()
+        st.markdown(f"**{len(batch_files)}개 파일 분석 중...**")
+
+        results = []
+        errors  = []
+        progress = st.progress(0)
+        status   = st.empty()
+
+        for i, f in enumerate(batch_files):
+            status.text(f"처리 중: {f.name} ({i+1}/{len(batch_files)})")
+            progress.progress((i+1) / len(batch_files))
+
+            try:
+                raw = f.read()
+
+                # ── .mat 처리 ──────────────────
+                if batch_mode == "📂 .mat 파일 (MATLAB 형식)":
+                    cycles_data, bat_name = parse_nasa_mat(raw)
+                    soh_records = compute_soh_from_mat(cycles_data)
+
+                    if not soh_records:
+                        errors.append({'파일명': f.name, '오류': '방전 사이클 없음'})
+                        continue
+
+                    last       = soh_records[-1]
+                    soh_val    = round(last['soh_actual'], 2)
+                    soh_method = "실측 (방전 용량)"
+                    cycle_cnt  = last['discharge_idx']
+                    est_years  = round(cycle_cnt / 365.0, 1)
+                    capacity   = round(last['capacity_ah'], 4)
+
+                # ── CSV 처리 ───────────────────
+                else:
+                    import io
+                    df_b = pd.read_csv(io.BytesIO(raw))
+
+                    # 컬럼 자동 매핑
+                    col_map = {}
+                    for col in df_b.columns:
+                        cl_name = col.lower()
+                        if any(k in cl_name for k in ['cycle','cyc','사이클']):
+                            col_map['cycle'] = col
+                        elif any(k in cl_name for k in ['voltage','volt','전압']):
+                            col_map['voltage'] = col
+                        elif any(k in cl_name for k in ['current','amp','전류']):
+                            col_map['current'] = col
+                        elif any(k in cl_name for k in ['temp','온도']):
+                            col_map['temperature'] = col
+                        elif any(k in cl_name for k in ['time','시간']):
+                            col_map['time_s'] = col
+                        elif any(k in cl_name for k in ['capacity','용량','cap']):
+                            col_map['capacity'] = col
+
+                    df_b = df_b.rename(columns={v:k for k,v in col_map.items()})
+
+                    # capacity 있으면 실측 SOH 계산
+                    if 'capacity' in df_b.columns and 'cycle' in df_b.columns:
+                        cap_per_cycle = df_b.groupby('cycle')['capacity'].max()
+                        rated         = cap_per_cycle.iloc[0]
+                        last_cap      = cap_per_cycle.iloc[-1]
+                        soh_val       = round(last_cap / rated * 100, 2)
+                        soh_method    = "실측 (방전 용량)"
+                        cycle_cnt     = int(cap_per_cycle.index[-1])
+                        est_years     = round(cycle_cnt / 365.0, 1)
+                        capacity      = round(float(last_cap), 4)
+                    elif {'cycle','voltage','current','temperature','time_s'}.issubset(df_b.columns):
+                        # ML 추정
+                        feat_list = extract_bms_features_from_csv(df_b, batch_bat_type)
+                        if not feat_list:
+                            errors.append({'파일명': f.name, '오류': '피처 추출 실패'})
+                            continue
+                        last_f    = feat_list[-1]
+                        soh_val   = predict_soh_bms(
+                            bms_models, batch_bat_type,
+                            last_f['cycle_count'], last_f['years'],
+                            last_f['internal_resistance_ohm']
+                        )
+                        soh_method = "ML 추정 (용량 미측정)"
+                        cycle_cnt  = int(last_f['cycle_count'])
+                        est_years  = round(last_f['years'], 1)
+                        capacity   = None
+                    else:
+                        errors.append({'파일명': f.name, '오류': f"필수 컬럼 없음: {list(df_b.columns)}"})
+                        continue
+
+                # ── 공통 판정 ──────────────────
+                tier        = get_soh_tier(soh_val)
+                tier_text, tier_color = TIER_META[tier]
+                props_b     = BAT_PROPS[batch_bat_type]
+                cycle_ratio = cycle_cnt / props_b['cycle_life']
+                cal_rate    = props_b.get('calendar_aging_rate_pct', 2.0)
+                cal_loss    = est_years * cal_rate
+
+                # 추천 활용처 1순위
+                recs = get_recommendations(soh_val, est_years, cycle_cnt,
+                                           batch_bat_type, batch_voltage)
+                top_rec = recs[0]['name'] if recs else "해당 없음 (해체 권장)"
+
+                results.append({
+                    '파일명':        f.name,
+                    '배터리 종류':   batch_bat_type,
+                    'SOH (%)':       soh_val,
+                    'SOH 계산 방법': soh_method,
+                    '판정':          tier_text,
+                    '1순위 활용처':  top_rec,
+                    '방전 사이클':   cycle_cnt,
+                    '추정 연수':     est_years,
+                    '사이클 소모율 (%)': round(cycle_ratio * 100, 1),
+                    '캘린더 열화 예상 (%)': round(cal_loss, 1),
+                    '측정 용량 (Ah)': capacity if capacity else '-',
+                })
+
+            except Exception as e:
+                errors.append({'파일명': f.name, '오류': str(e)})
+
+        progress.empty()
+        status.empty()
+
+        if not results and not errors:
+            st.warning("분석 결과가 없습니다.")
+        else:
+            df_result = pd.DataFrame(results) if results else pd.DataFrame()
+
+            # ── 요약 대시보드 ──────────────────
+            if not df_result.empty:
+                st.markdown('<div class="section-title">📊 분석 결과 요약</div>',
+                            unsafe_allow_html=True)
+
+                total    = len(df_result)
+                reuse    = len(df_result[df_result['판정'].str.contains('재사용')])
+                repurpose= len(df_result[df_result['판정'].str.contains('재활용')])
+                recycle  = len(df_result[df_result['판정'].str.contains('해체')])
+
+                c1, c2, c3, c4 = st.columns(4)
+                for col, val, label, color in zip(
+                    [c1, c2, c3, c4],
+                    [total, reuse, repurpose, recycle],
+                    ["총 배터리 수", "✅ 재사용", "♻️ 재활용", "🗑️ 해체"],
+                    ["#00d4aa", "#00d4aa", "#f0a500", "#e05555"]
+                ):
+                    col.markdown(f"""
+                    <div class="metric-card">
+                        <div class="metric-val" style="color:{color}">{val}개</div>
+                        <div class="metric-label">{label}</div>
+                        <div class="ref-text">{round(val/total*100)}%</div>
+                    </div>""", unsafe_allow_html=True)
+
+                # SOH 분포 차트
+                st.markdown('<div class="section-title">📈 SOH 분포</div>',
+                            unsafe_allow_html=True)
+                fig_hist = go.Figure()
+                fig_hist.add_trace(go.Histogram(
+                    x=df_result['SOH (%)'],
+                    nbinsx=20,
+                    marker_color='#00d4aa',
+                    opacity=0.8,
+                    name='배터리 수'
+                ))
+                fig_hist.add_vline(x=80, line_dash='dash', line_color='#f0a500',
+                                   annotation_text='80% 재사용 기준')
+                fig_hist.add_vline(x=50, line_dash='dash', line_color='#e05555',
+                                   annotation_text='50% 해체 기준')
+                fig_hist.update_layout(
+                    xaxis_title='SOH (%)', yaxis_title='배터리 수 (개)',
+                    template='plotly_dark', height=300,
+                    margin=dict(l=0, r=0, t=10, b=0)
+                )
+                st.plotly_chart(fig_hist, use_container_width=True)
+
+                # 결과 테이블
+                st.markdown('<div class="section-title">📋 배터리별 상세 결과</div>',
+                            unsafe_allow_html=True)
+                st.dataframe(df_result, use_container_width=True, hide_index=True)
+
+                # 엑셀 다운로드
+                import io as _io
+                excel_buf = _io.BytesIO()
+                with pd.ExcelWriter(excel_buf, engine='openpyxl') as writer:
+                    df_result.to_excel(writer, sheet_name='배터리_SOH_분석', index=False)
+
+                    # 요약 시트
+                    summary = pd.DataFrame({
+                        '구분':   ['총 배터리', '재사용 (SOH>80%)',
+                                   '재활용 (SOH 50~80%)', '해체 (SOH≤50%)'],
+                        '수량':   [total, reuse, repurpose, recycle],
+                        '비율(%)': [100,
+                                    round(reuse/total*100, 1),
+                                    round(repurpose/total*100, 1),
+                                    round(recycle/total*100, 1)],
+                    })
+                    summary.to_excel(writer, sheet_name='요약', index=False)
+
+                st.download_button(
+                    label="⬇️ 엑셀 다운로드 (.xlsx)",
+                    data=excel_buf.getvalue(),
+                    file_name="배터리_SOH_분석결과.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    type="primary"
+                )
+
+            # 오류 파일 표시
+            if errors:
+                with st.expander(f"⚠️ 처리 실패 파일 {len(errors)}개", expanded=False):
+                    st.dataframe(pd.DataFrame(errors),
+                                 use_container_width=True, hide_index=True)
+
+    else:
+        st.info(
+            "👆 파일을 업로드하면 일괄 분석이 시작됩니다. "
+            "지원 형식: .mat (MATLAB), .csv (BMS 로그). "
+            "결과: SOH, 재사용/재활용/해체 판정, 추천 활용처 → 엑셀 다운로드"
+        )
