@@ -1042,10 +1042,11 @@ elif method == "📟 BMS 기반 예측":
             )
 
             features_dict = {
-                'bat_type': bat_type,
-                'cycle':    float(last['discharge_idx']),
-                'years':    est_years,
-                'int_r':    ir,
+                'bat_type':    bat_type,
+                'cycle':       float(last['discharge_idx']),
+                'years':       est_years,
+                'int_r':       ir,
+                'soh_actual':  last['soh_actual'],  # 실측값 비교용
             }
 
     # ── CSV 업로드 ──────────────────────────────
@@ -1216,13 +1217,68 @@ elif method == "📟 BMS 기반 예측":
 | 자동계산 전압 강하 | {feats_auto[5]:.4f} V | 물리 모델 역산 |
             """)
 
-        fd = features_dict
-        soh = predict_soh_bms(
-            bms_models,
-            fd['bat_type'], fd['cycle'], fd['years'], fd['int_r']
-        )
-        render_result(soh, "BMS ML 예측 (앙상블 모델)", bat_type,
-                      years, cycles, voltage, "📟 BMS 기반")
+        fd  = features_dict
+
+        # .mat 파일 업로드 시: 실측 SOH를 직접 사용하고 예측과 비교
+        if fd.get('soh_actual') is not None:
+            soh_actual = fd['soh_actual']
+            # ML 예측도 수행 (비교용)
+            soh_pred = predict_soh_bms(
+                bms_models,
+                fd['bat_type'], fd['cycle'], fd['years'], fd['int_r']
+            )
+            err       = soh_pred - soh_actual
+            err_color = "#00d4aa" if abs(err) <= 5 else "#f0a500" if abs(err) <= 10 else "#e05555"
+
+            st.markdown('<div class="section-title">📊 실측 vs 예측 SOH 비교</div>',
+                        unsafe_allow_html=True)
+            c1, c2, c3 = st.columns(3)
+            c1.markdown(f"""
+            <div class="metric-card">
+                <div class="metric-val" style="color:#00d4aa">{soh_actual:.1f}%</div>
+                <div class="metric-label">✅ 실측 SOH (진단 기준)</div>
+                <div class="ref-text">방전 용량 / 초기 용량 × 100 — 가장 정확</div>
+            </div>""", unsafe_allow_html=True)
+            c2.markdown(f"""
+            <div class="metric-card">
+                <div class="metric-val" style="color:#aaa">{soh_pred:.1f}%</div>
+                <div class="metric-label">ML 예측 SOH (참고용)</div>
+                <div class="ref-text">사이클·연수만으로 추정 — EIS 없을 때 사용</div>
+            </div>""", unsafe_allow_html=True)
+            c3.markdown(f"""
+            <div class="metric-card">
+                <div class="metric-val" style="color:{err_color}">{err:+.1f}%</div>
+                <div class="metric-label">예측 오차</div>
+                <div class="ref-text">충방전 속도·온도 조건 차이로 오차 발생 가능</div>
+            </div>""", unsafe_allow_html=True)
+
+            # 오차가 클 때 원인 설명
+            if abs(err) > 10:
+                st.warning(
+                    f"⚠️ **ML 예측 오차 {err:+.1f}%** — "
+                    f"사이클 수만으로는 충방전 속도(C-rate)·온도 등 사용 조건을 알 수 없어 "
+                    f"오차가 발생합니다. "
+                    f"**진단은 실측 SOH({soh_actual:.1f}%) 기준으로 수행됩니다.**"
+                )
+            st.divider()
+
+            # 진단은 실측 SOH 기준으로 수행 (더 정확)
+            soh       = soh_actual
+            soh_label = "실측 SOH (방전 용량 기반)"
+            use_cycle = fd['cycle']
+            use_years = fd['years']
+        else:
+            # 수동입력 / CSV: ML 예측값 사용
+            soh = predict_soh_bms(
+                bms_models,
+                fd['bat_type'], fd['cycle'], fd['years'], fd['int_r']
+            )
+            soh_label = "BMS ML 예측 (앙상블 모델)"
+            use_cycle = fd['cycle']
+            use_years = fd['years']
+
+        render_result(soh, soh_label, bat_type,
+                      use_years, use_cycle, voltage, "📟 BMS 기반")
 
 # ═══════════════════════════════════════
 elif method == "✏️ SOH 직접 입력":
