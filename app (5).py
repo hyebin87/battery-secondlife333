@@ -972,14 +972,87 @@ elif method == "📟 BMS 기반 예측":
 
     bms_input_mode = st.radio(
         "입력 방식",
-        ["📁 CSV 파일 업로드 (BMS 로그)", "🎛️ 수동 입력 (슬라이더)"],
+        ["📂 NASA .mat 업로드 (B0005~B0018)",
+         "📁 CSV 파일 업로드 (BMS 로그)",
+         "🎛️ 수동 입력 (슬라이더)"],
         horizontal=True
     )
 
     features_dict = None
 
+    # ── NASA .mat 업로드 ────────────────────────
+    if bms_input_mode == "📂 NASA .mat 업로드 (B0005~B0018)":
+        st.caption("NASA PCoE B0005~B0018 .mat 파일을 바로 업로드 → 최신 사이클 기준 SOH 예측")
+
+        mat_bms_file = st.file_uploader(
+            "NASA .mat 파일 업로드", type=['mat'],
+            help="B0005.mat / B0006.mat / B0007.mat / B0018.mat"
+        )
+        if mat_bms_file:
+            with st.spinner("📂 .mat 파싱 중..."):
+                try:
+                    raw = mat_bms_file.read()
+                    cycles_data, bat_name = parse_nasa_mat(raw)
+                    soh_records = compute_soh_from_mat(cycles_data)
+                except Exception as e:
+                    st.error(f"파싱 실패: {e}")
+                    st.stop()
+
+            if not soh_records:
+                st.error("방전 사이클 데이터를 찾지 못했습니다.")
+                st.stop()
+
+            st.success(f"✅ **{bat_name}** | 방전 사이클 {len(soh_records)}개 파싱 완료")
+
+            # 최신 사이클 기준으로 SOH 예측
+            last = soh_records[-1]
+            r_ref_now = BAT_RESISTANCE[bat_type]
+            if last.get('internal_r') is not None:
+                ir = float(np.clip(last['internal_r'],
+                                   r_ref_now['r0'], r_ref_now['r_max']*1.5))
+            else:
+                cl_now = BAT_PROPS[bat_type]['cycle_life']
+                cr_ratio = min(last['discharge_idx'] / cl_now, 1.3)
+                ir = r_ref_now['r0'] + (r_ref_now['r_max']-r_ref_now['r0'])*cr_ratio
+
+            est_years = last['discharge_idx'] / 365.0
+
+            # 사이클별 SOH 열화 그래프
+            df_mat_bms = pd.DataFrame(soh_records)
+            fig_mat = go.Figure()
+            fig_mat.add_trace(go.Scatter(
+                x=df_mat_bms['discharge_idx'], y=df_mat_bms['soh_actual'],
+                mode='lines+markers', name='실측 SOH',
+                line=dict(color='#00d4aa', width=2), marker=dict(size=4)
+            ))
+            fig_mat.add_hline(y=80, line_dash='dash', line_color='#f0a500',
+                              annotation_text='SOH 80% 재사용 기준')
+            fig_mat.add_hline(y=50, line_dash='dash', line_color='#e05555',
+                              annotation_text='SOH 50% 해체 기준')
+            fig_mat.update_layout(
+                xaxis_title='방전 사이클 수', yaxis_title='SOH (%)',
+                template='plotly_dark', height=280,
+                margin=dict(l=0,r=0,t=10,b=0)
+            )
+            st.plotly_chart(fig_mat, use_container_width=True)
+
+            # 최신 사이클 정보 표시
+            st.info(
+                f"📌 **최신 사이클 기준 예측** — "
+                f"방전 사이클 {last['discharge_idx']}회 | "
+                f"실측 SOH {last['soh_actual']:.1f}% | "
+                f"실측 용량 {last['capacity_ah']:.3f} Ah"
+            )
+
+            features_dict = {
+                'bat_type': bat_type,
+                'cycle':    float(last['discharge_idx']),
+                'years':    est_years,
+                'int_r':    ir,
+            }
+
     # ── CSV 업로드 ──────────────────────────────
-    if bms_input_mode == "📁 CSV 파일 업로드 (BMS 로그)":
+    elif bms_input_mode == "📁 CSV 파일 업로드 (BMS 로그)":
         st.markdown("**CSV 컬럼 형식:** `cycle, voltage, current, temperature, capacity, time_s`")
 
         with st.expander("📄 샘플 CSV 형식 보기"):
@@ -1009,7 +1082,6 @@ elif method == "📟 BMS 기반 예측":
                         st.error("피처 추출 실패. 데이터를 확인해주세요.")
                     else:
                         last = feat_list[-1]
-                        # CSV도 핵심 3개만 추출해서 자동계산 경로 사용
                         features_dict = {
                             'bat_type': bat_type,
                             'cycle':    last['cycle_count'],
@@ -1018,7 +1090,6 @@ elif method == "📟 BMS 기반 예측":
                         }
                         st.success(f"✅ {len(feat_list)}개 사이클 데이터 추출 완료 — 최신 사이클 기준 예측")
 
-                        # 사이클별 내부 저항 트렌드 시각화 (노화 지표)
                         r_trend = [f['internal_resistance_ohm'] for f in feat_list]
                         fig_trend = go.Figure()
                         fig_trend.add_trace(go.Scatter(
