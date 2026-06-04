@@ -208,90 +208,114 @@ def predict_soh_eis(models, zr, zi):
     return round(float(np.clip(pred, 50, 100)), 1)
 
 # ═══════════════════════════════════════════════
-# 2. BMS 모델 (NASA PCoE Battery Dataset 기반)
+# 2. BMS 모델 (NASA PCoE + Ali et al. 2023 기반)
 #
-# NASA PCoE 데이터셋 특징 (실제 측정 기반 합성):
-# - 배터리: LiCoO2 18650 셀 (B0005~B0018)
-# - 정격 용량: 2 Ah
-# - 측정: 전압(V), 전류(A), 온도(°C), 방전 용량(Ah)
-# - SOH = 현재 방전 용량 / 초기 방전 용량 × 100
-# - 출처: NASA PCoE, ti.arc.nasa.gov/tech/dash/groups/pcoe/
+# 학습 데이터 설계 근거:
+# - 배터리별 사이클 수명: Ali et al. (2023) Section 2
+#     NCM 2,000회 / LFP 4,000회 / NCA 1,500회
+# - 캘린더 열화율: Ali et al. (2023) Section 3
+#     LFP <1%/년 / NCM·NCA ~2%/년 / LCO ~3%/년
+# - 내부 저항 범위: NASA PCoE B0005~B0018 실측
+#     LCO 초기 0.15Ω → 말기 0.30Ω
+# - SOH 열화 모델:
+#     SOH = 100 - 20×min(cycle/cycle_life, 1.5) - cal_rate×years
 #
-# 피처 10개:
-#   cycle_count, discharge_capacity, charge_time, discharge_time,
-#   voltage_drop, temp_max, temp_rise, internal_resistance,
-#   coulombic_efficiency, voltage_plateau
+# 피처 9개 (수동 입력 가능한 BMS 측정값 중심):
+#   cycle_count, years, internal_resistance,
+#   charge_time, temp_rise, voltage_drop,
+#   coulombic_efficiency, bat_type_enc, cycle_life
+#
+# 출처: Ali et al. (2023); NASA PCoE ti.arc.nasa.gov/tech/dash/groups/pcoe/
 # ═══════════════════════════════════════════════
+
+# 배터리 종류 인코딩
+BAT_ENC = {"NCM": 0, "LFP": 1, "NCA": 2, "LCO": 3}
+# 배터리별 내부저항 기준값 (Ali et al. 2023 + NASA PCoE)
+BAT_RESISTANCE = {
+    "NCM": dict(r0=0.10, r_max=0.22),
+    "LFP": dict(r0=0.08, r_max=0.16),
+    "NCA": dict(r0=0.12, r_max=0.28),
+    "LCO": dict(r0=0.15, r_max=0.30),
+}
+
 @st.cache_resource
 def train_bms_model():
     """
-    NASA PCoE 배터리 데이터셋 패턴 기반 BMS SOH 예측 모델 학습
-    실제 B0005~B0018 측정 데이터의 통계적 특성을 반영한 학습 데이터 사용
-    출처: ti.arc.nasa.gov/tech/dash/groups/pcoe/prognostic-data-repository/
+    배터리 종류별 열화 특성을 반영한 BMS SOH 예측 모델 학습
+    - NCM/LFP/NCA/LCO 각 500개 = 총 2,000개 학습 데이터
+    - 사이클 범위: 0 ~ cycle_life × 1.5 (수명 초과 케이스 포함)
+    - SOH 열화: 사이클 열화 + 캘린더 열화 복합 반영
+
+    출처: Ali et al. (2023); NASA PCoE
     """
     np.random.seed(42)
-    N = 800
+    N_per = 500
+    all_X, all_y = [], []
 
-    # NASA 실측 패턴: 지수 감쇠 기반 SOH 곡선
-    cycle = np.random.randint(0, 1000, N)
-    soh   = np.clip(100 * np.exp(-cycle / 2200) + np.random.normal(0, 2, N), 50, 100)
+    for bat, cfg in BAT_PROPS.items():
+        cl  = cfg['cycle_life']
+        cr  = cfg.get('calendar_aging_rate_pct', 2.0)
+        r0  = BAT_RESISTANCE[bat]['r0']
+        rm  = BAT_RESISTANCE[bat]['r_max']
 
-    rated_cap   = 2.0
-    # 피처 1: 방전 용량 (SOH와 직접 비례 — 가장 중요한 피처)
-    discharge_capacity = rated_cap * soh / 100 + np.random.normal(0, 0.03, N)
-    # 피처 2: 완충 소요 시간 (노화 → 충전 시간 증가)
-    charge_time        = 3600 * (1 + (100-soh)/200) + np.random.normal(0, 120, N)
-    # 피처 3: 완방 소요 시간 (노화 → 방전 시간 감소)
-    discharge_time     = 3600 * soh/100 + np.random.normal(0, 100, N)
-    # 피처 4: 충전 말기 전압 강하 (노화 → 전압 강하 증가)
-    voltage_drop       = 0.05 + (100-soh)/1000 + np.random.normal(0, 0.005, N)
-    # 피처 5: 최대 온도 (노화 → 발열 증가)
-    temp_max           = 30 + (100-soh)/5 + np.random.normal(0, 1.5, N)
-    # 피처 6: 온도 상승폭
-    temp_rise          = 5 + (100-soh)/10 + np.random.normal(0, 0.5, N)
-    # 피처 7: 내부 저항 (노화 → 저항 증가, NASA B0005 실측: 0.15→0.25Ω)
-    internal_r         = 0.15 + (100-soh)/500 + np.random.normal(0, 0.005, N)
-    # 피처 8: 쿨롱 효율 (방전/충전 용량 비율)
-    coulombic_eff      = 0.99 - (100-soh)/5000 + np.random.normal(0, 0.002, N)
-    # 피처 9: 전압 평탄 구간 길이 (LFP 특성 반영)
-    voltage_plateau    = 2000 * soh/100 + np.random.normal(0, 50, N)
-    # 피처 10: 사이클 수
-    cycle_feat         = cycle.astype(float)
+        # 사이클: 0 ~ cycle_life×1.5 (수명 초과 포함)
+        cycle = np.random.randint(0, int(cl * 1.5), N_per).astype(float)
+        years = np.random.uniform(0, 15, N_per)
 
-    X = np.column_stack([
-        cycle_feat, discharge_capacity, charge_time, discharge_time,
-        voltage_drop, temp_max, temp_rise, internal_r,
-        coulombic_eff, voltage_plateau
-    ])
+        # SOH 열화 모델 (Ali et al. 2023)
+        soh_cycle = 100 - 20 * np.clip(cycle / cl, 0, 1.5)
+        soh_cal   = cr * years
+        soh = np.clip(soh_cycle - soh_cal + np.random.normal(0, 1.5, N_per), 50, 100)
+
+        # 피처 생성 (BMS 측정값, SOH와 물리적으로 연동)
+        # 내부 저항: 사이클비에 비례해 r0→rm 증가 (NASA PCoE 실측 패턴)
+        int_r   = r0 + (rm-r0)*np.clip(cycle/cl, 0, 1.3) + np.random.normal(0, 0.004, N_per)
+        int_r   = np.clip(int_r, r0, rm*1.3)
+        # 충전 시간: 노화 → 증가
+        chg_t   = 3600*(1+(100-soh)/300) + np.random.normal(0, 100, N_per)
+        # 온도 상승폭: 노화 → 발열 증가
+        t_rise  = 5+(100-soh)/12 + np.random.normal(0, 0.5, N_per)
+        # 전압 강하: 노화 → 증가
+        v_drop  = 0.05+(100-soh)/1200 + np.random.normal(0, 0.004, N_per)
+        # 쿨롱 효율: 노화 → 감소
+        c_eff   = 0.99-(100-soh)/6000 + np.random.normal(0, 0.002, N_per)
+        bat_f   = np.full(N_per, float(BAT_ENC[bat]))
+        cl_f    = np.full(N_per, float(cl))
+
+        X = np.column_stack([cycle, years, int_r, chg_t, t_rise,
+                             v_drop, c_eff, bat_f, cl_f])
+        all_X.append(X); all_y.append(soh)
+
+    X_all = np.vstack(all_X)
+    y_all = np.concatenate(all_y)
 
     scaler = StandardScaler()
-    Xs     = scaler.fit_transform(X)
+    Xs     = scaler.fit_transform(X_all)
 
-    gb = GradientBoostingRegressor(n_estimators=300, max_depth=5,
-                                   learning_rate=0.05, subsample=0.8, random_state=42)
-    rf = RandomForestRegressor(n_estimators=200, max_depth=7, random_state=42)
-    gb.fit(Xs, soh); rf.fit(Xs, soh)
+    gb = GradientBoostingRegressor(n_estimators=400, max_depth=6,
+                                   learning_rate=0.04, subsample=0.8, random_state=42)
+    rf = RandomForestRegressor(n_estimators=200, max_depth=8, random_state=42)
+    gb.fit(Xs, y_all); rf.fit(Xs, y_all)
 
-    cv_gb = cross_val_score(gb, Xs, soh, cv=5, scoring='r2').mean()
-    cv_rf = cross_val_score(rf, Xs, soh, cv=5, scoring='r2').mean()
+    cv_gb = cross_val_score(gb, Xs, y_all, cv=5, scoring='r2').mean()
+    cv_rf = cross_val_score(rf, Xs, y_all, cv=5, scoring='r2').mean()
 
     return {'gb': gb, 'rf': rf, 'scaler': scaler}, cv_gb, cv_rf
 
+# BMS 피처 정의 (9개)
 BMS_FEATURE_COLS = [
-    'cycle_count', 'discharge_capacity_ah', 'charge_time_s',
-    'discharge_time_s', 'voltage_drop_v', 'temp_max_c',
-    'temp_rise_c', 'internal_resistance_ohm',
-    'coulombic_efficiency', 'voltage_plateau_s'
+    'cycle_count', 'years', 'internal_resistance_ohm',
+    'charge_time_s', 'temp_rise_c', 'voltage_drop_v',
+    'coulombic_efficiency', 'bat_type_enc', 'cycle_life'
 ]
 BMS_FEATURE_LABELS = [
-    '사이클 수', '방전 용량 (Ah)', '충전 시간 (s)',
-    '방전 시간 (s)', '전압 강하 (V)', '최대 온도 (°C)',
-    '온도 상승폭 (°C)', '내부 저항 (Ω)',
-    '쿨롱 효율', '전압 평탄 구간 (s)'
+    '사이클 수', '사용 연수 (년)', '내부 저항 (Ω)',
+    '충전 시간 (s)', '온도 상승폭 (°C)', '전압 강하 (V)',
+    '쿨롱 효율', '배터리 종류 (인코딩)', '설계 사이클 수명'
 ]
 
 def predict_soh_bms(models, features_dict):
-    """BMS 피처 딕셔너리 → SOH 예측"""
+    """BMS 피처 딕셔너리 → SOH 예측 (앙상블)"""
     row = [features_dict.get(col, 0) for col in BMS_FEATURE_COLS]
     Xs  = models['scaler'].transform([row])
     pred = (models['gb'].predict(Xs)[0] + models['rf'].predict(Xs)[0]) / 2
