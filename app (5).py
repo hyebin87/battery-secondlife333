@@ -1017,6 +1017,9 @@ elif method == "📟 BMS 기반 예측":
                 st.error("방전 사이클 데이터를 찾지 못했습니다.")
                 st.stop()
 
+            # 최신 사이클 기준으로 SOH 예측
+            last = soh_records[-1]
+
             st.success(f"✅ **{bat_name}** | 방전 사이클 {len(soh_records)}개 파싱 완료")
             st.caption(
                 f"📌 사이드바 설정(사이클·연수)은 무시됩니다. "
@@ -1024,9 +1027,6 @@ elif method == "📟 BMS 기반 예측":
                 f"방전 {last['discharge_idx']}회 / "
                 f"약 {round(last['discharge_idx']/365.0, 1)}년으로 자동 적용됩니다."
             )
-
-            # 최신 사이클 기준으로 SOH 예측
-            last = soh_records[-1]
             r_ref_now = BAT_RESISTANCE[bat_type]
             if last.get('internal_r') is not None:
                 ir = float(np.clip(last['internal_r'],
