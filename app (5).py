@@ -802,11 +802,12 @@ elif method == "📟 BMS 기반 예측":
         )
         c1, c2 = st.columns(2)
         with c1:
-            # 사이클: 배터리 종류별 수명 1.5배까지 입력 가능
-            max_cyc = float(props_now['cycle_life'] * 2)
+            # 사이클: 배터리 종류별 수명 2배까지 입력 가능
+            max_cyc     = float(props_now['cycle_life'] * 2)
+            default_cyc = min(float(cycles), max_cyc)  # value>max 에러 방지
             cycle_cnt = st.number_input(
                 f"사이클 수 (설계 수명: {props_now['cycle_life']:,}회)",
-                0.0, max_cyc, float(cycles), step=10.0,
+                0.0, max_cyc, default_cyc, step=10.0,
                 help=f"{bat_type} 설계 사이클 수명 기준 (Ali et al. 2023)"
             )
             charge_t = st.number_input(
@@ -818,11 +819,24 @@ elif method == "📟 BMS 기반 예측":
                 help="충방전 중 온도 상승폭. 노화 시 증가"
             )
         with c2:
+            # ── 내부 저항 자동 계산 ──────────────────────────
+            # 사이클비에 따라 r0→r_max 선형 증가 (NASA PCoE 실측 기반)
+            # 사용자가 사이클 수를 바꾸면 기본값이 자동으로 갱신됨
+            cycle_ratio_now = min(cycle_cnt / props_now['cycle_life'], 1.3)
+            auto_r = round(
+                r_ref['r0'] + (r_ref['r_max'] - r_ref['r0']) * cycle_ratio_now,
+                4
+            )
+            st.caption(
+                f"💡 사이클비 {round(cycle_ratio_now*100)}% 기준 "
+                f"자동 계산 내부저항: **{auto_r} Ω** "
+                f"(신품 {r_ref['r0']} → 말기 {r_ref['r_max']} Ω, NASA PCoE)"
+            )
             internal_r_v = st.number_input(
-                "내부 저항 (Ω)",
+                "내부 저항 (Ω) — 사이클에 따라 자동 계산",
                 float(r_ref['r0']), float(r_ref['r_max'] * 1.5),
-                float(r_ref['r0']), step=0.005,
-                help=f"{bat_type} 신품 {r_ref['r0']}Ω → 말기 {r_ref['r_max']}Ω (NASA PCoE)"
+                float(auto_r), step=0.005,
+                help=f"사이클비 {round(cycle_ratio_now*100)}% 반영값. 직접 수정도 가능"
             )
             voltage_drop_v = st.number_input(
                 "전압 강하 (V)", 0.0, 0.5, 0.05, step=0.005,
