@@ -411,6 +411,200 @@ def extract_bms_features_from_csv(df, bat_type):
             continue
     return features_list
 
+
+# ═══════════════════════════════════════════════
+# NASA .mat 파일 파싱 및 모델 검증
+# 출처: NASA PCoE Battery Dataset
+#   ti.arc.nasa.gov/tech/dash/groups/pcoe/prognostic-data-repository/
+# ═══════════════════════════════════════════════
+def parse_nasa_mat(file_bytes):
+    """
+    NASA PCoE .mat 파일 파싱
+    - v7.3 이하: scipy.io.loadmat
+    - v7.3 (HDF5): h5py
+
+    반환:
+        cycles_data: list of dict
+            {
+              'cycle_idx': int,
+              'type': 'charge'|'discharge'|'impedance',
+              'capacity_ah': float (discharge만),
+              'voltage_mean': float,
+              'current_mean': float,
+              'temp_mean': float,
+              'charge_time_s': float,
+              'internal_r': float (impedance만, 없으면 None),
+            }
+        battery_name: str (예: 'B0005')
+    """
+    import io
+
+    # ── scipy 시도 (v7.3 이하) ──────────────────
+    try:
+        import scipy.io
+        mat = scipy.io.loadmat(
+            io.BytesIO(file_bytes), simplify_cells=True
+        )
+        # 배터리 이름 찾기 (B0005, B0006, ...)
+        bat_name = [k for k in mat.keys() if k.startswith('B')][0]
+        cycles_raw = mat[bat_name]['cycle']
+        return _parse_scipy_cycles(cycles_raw), bat_name
+    except Exception:
+        pass
+
+    # ── h5py 시도 (v7.3 HDF5) ──────────────────
+    try:
+        import h5py
+        import tempfile, os
+        with tempfile.NamedTemporaryFile(delete=False, suffix='.mat') as tmp:
+            tmp.write(file_bytes)
+            tmp_path = tmp.name
+        try:
+            with h5py.File(tmp_path, 'r') as f:
+                bat_name = [k for k in f.keys() if k.startswith('B')][0]
+                return _parse_hdf5_cycles(f[bat_name]), bat_name
+        finally:
+            os.unlink(tmp_path)
+    except Exception as e:
+        raise ValueError(f"mat 파일 파싱 실패: {e}")
+
+
+def _parse_scipy_cycles(cycles_raw):
+    """scipy simplify_cells=True로 파싱된 사이클 처리"""
+    results = []
+    if not hasattr(cycles_raw, '__iter__'):
+        cycles_raw = [cycles_raw]
+
+    for i, c in enumerate(cycles_raw):
+        try:
+            ctype = str(c.get('type', '')).strip().lower()
+            data  = c.get('data', {})
+            if not data:
+                continue
+
+            entry = {'cycle_idx': i, 'type': ctype,
+                     'capacity_ah': None, 'internal_r': None}
+
+            v = np.atleast_1d(data.get('Voltage_measured', []))
+            a = np.atleast_1d(data.get('Current_measured', []))
+            t = np.atleast_1d(data.get('Temperature_measured', []))
+            ts= np.atleast_1d(data.get('Time', []))
+
+            entry['voltage_mean']  = float(np.mean(v))  if len(v)  else 0.0
+            entry['current_mean']  = float(np.mean(np.abs(a))) if len(a) else 0.0
+            entry['temp_mean']     = float(np.mean(t))  if len(t)  else 25.0
+            entry['charge_time_s'] = float(ts[-1]-ts[0]) if len(ts)>1 else 0.0
+
+            if ctype == 'discharge':
+                cap = data.get('Capacity', None)
+                if cap is not None:
+                    entry['capacity_ah'] = float(np.atleast_1d(cap).flat[0])
+
+            if ctype == 'impedance':
+                re = data.get('Re', None)
+                if re is not None:
+                    entry['internal_r'] = float(np.atleast_1d(re).flat[0])
+
+            results.append(entry)
+        except Exception:
+            continue
+    return results
+
+
+def _parse_hdf5_cycles(bat_group):
+    """h5py로 파싱된 HDF5 구조 처리"""
+    import h5py
+    results = []
+    cycle_group = bat_group.get('cycle', bat_group)
+
+    for i, key in enumerate(cycle_group.keys()):
+        try:
+            c = cycle_group[key]
+            ctype_raw = c.get('type', None)
+            if ctype_raw is None:
+                continue
+            # HDF5에서 문자열 디코딩
+            if isinstance(ctype_raw, h5py.Dataset):
+                ctype = ''.join(chr(x) for x in ctype_raw[()]).strip().lower()
+            else:
+                ctype = str(ctype_raw).strip().lower()
+
+            data = c.get('data', c)
+            entry = {'cycle_idx': i, 'type': ctype,
+                     'capacity_ah': None, 'internal_r': None}
+
+            def get_arr(key):
+                d = data.get(key, None)
+                if d is None: return np.array([])
+                return np.array(d[()])
+
+            v  = get_arr('Voltage_measured')
+            a  = get_arr('Current_measured')
+            t  = get_arr('Temperature_measured')
+            ts = get_arr('Time')
+
+            entry['voltage_mean']  = float(np.mean(v))  if len(v)  else 0.0
+            entry['current_mean']  = float(np.mean(np.abs(a))) if len(a) else 0.0
+            entry['temp_mean']     = float(np.mean(t))  if len(t)  else 25.0
+            entry['charge_time_s'] = float(ts[-1]-ts[0]) if len(ts)>1 else 0.0
+
+            if ctype == 'discharge':
+                cap = data.get('Capacity', None)
+                if cap is not None:
+                    entry['capacity_ah'] = float(np.array(cap[()]).flat[0])
+
+            if ctype == 'impedance':
+                re = data.get('Re', None)
+                if re is not None:
+                    entry['internal_r'] = float(np.array(re[()]).flat[0])
+
+            results.append(entry)
+        except Exception:
+            continue
+    return results
+
+
+def compute_soh_from_mat(cycles_data):
+    """
+    discharge 사이클의 Capacity로 SOH 계산
+    SOH = 현재 방전 용량 / 초기 방전 용량 × 100
+    출처: NASA PCoE 데이터셋 정의
+    """
+    discharge = [c for c in cycles_data if c['type'] == 'discharge'
+                 and c['capacity_ah'] is not None]
+    if not discharge:
+        return []
+
+    rated_cap = discharge[0]['capacity_ah']  # 초기 용량 = 정격 용량
+    result = []
+    for i, c in enumerate(discharge):
+        soh = c['capacity_ah'] / rated_cap * 100
+        result.append({
+            'discharge_idx':  i,
+            'cycle_idx':      c['cycle_idx'],
+            'capacity_ah':    c['capacity_ah'],
+            'soh_actual':     round(soh, 2),
+            'voltage_mean':   c['voltage_mean'],
+            'current_mean':   c['current_mean'],
+            'temp_mean':      c['temp_mean'],
+            'charge_time_s':  c['charge_time_s'],
+        })
+
+    # impedance 사이클의 내부저항 매칭 (가장 가까운 사이클)
+    impedance = [c for c in cycles_data if c['type'] == 'impedance'
+                 and c['internal_r'] is not None]
+    if impedance:
+        imp_idx = np.array([c['cycle_idx'] for c in impedance])
+        imp_r   = np.array([c['internal_r'] for c in impedance])
+        for row in result:
+            nearest = np.argmin(np.abs(imp_idx - row['cycle_idx']))
+            row['internal_r'] = float(imp_r[nearest])
+    else:
+        for row in result:
+            row['internal_r'] = None
+
+    return result
+
 # ═══════════════════════════════════════════════
 # 공통 유틸
 # ═══════════════════════════════════════════════
@@ -664,8 +858,10 @@ with st.sidebar:
     st.markdown("### 🔬 분석 방법 선택")
     method = st.radio(
         "",
-        ["⚡ EIS 기반 예측", "📟 BMS 기반 예측", "✏️ SOH 직접 입력"],
-        help="EIS: 임피던스 분석 (정밀) | BMS: 충방전 데이터 (현장 적용)"
+        ["⚡ EIS 기반 예측", "📟 BMS 기반 예측", "✏️ SOH 직접 입력",
+         "🔬 NASA .mat 검증"],
+        help="EIS: 임피던스 분석 (정밀) | BMS: 충방전 데이터 | "
+             "NASA .mat: 실측 SOH vs 예측 정확도 검증"
     )
 
 with st.expander("ℹ️ SOH 판정 기준 (PMC11033388)", expanded=False):
@@ -938,3 +1134,171 @@ elif method == "✏️ SOH 직접 입력":
     if st.button("📊 분석 실행", type="primary"):
         render_result(soh_direct, "직접 입력 (IEC 62660-1 기준)", bat_type,
                       years, cycles, voltage, "✏️ 직접 입력")
+
+# ═══════════════════════════════════════
+elif method == "🔬 NASA .mat 검증":
+    st.markdown("### 🔬 NASA .mat 파일로 모델 정확도 검증")
+    st.caption(
+        "NASA PCoE Battery Dataset (.mat) 업로드 → 실측 SOH vs 예측 SOH 비교 | "
+        "출처: ti.arc.nasa.gov/tech/dash/groups/pcoe/prognostic-data-repository/"
+    )
+
+    with st.expander("📥 데이터셋 다운로드 안내", expanded=False):
+        st.markdown("""
+**NASA PCoE Battery Dataset 다운로드:**
+1. [Kaggle](https://www.kaggle.com/datasets/patrickfleith/nasa-battery-dataset) 검색: "NASA Battery Dataset"
+2. 또는 NASA 공식: ti.arc.nasa.gov → Battery Data Set
+3. B0005.mat / B0006.mat / B0007.mat / B0018.mat 중 하나 업로드
+
+**파일 구조:** 각 파일에 수백 개 충방전 사이클 데이터 포함  
+**SOH 계산:** 방전 용량 / 초기 용량 × 100 (NASA PCoE 정의)
+        """)
+
+    mat_file = st.file_uploader(
+        "NASA .mat 파일 업로드 (B0005~B0018)",
+        type=['mat'],
+        help="scipy(v7.3 이하) 또는 h5py(v7.3 HDF5) 자동 감지"
+    )
+
+    if mat_file:
+        with st.spinner("📂 .mat 파일 파싱 중..."):
+            try:
+                raw = mat_file.read()
+                cycles_data, bat_name = parse_nasa_mat(raw)
+                soh_records = compute_soh_from_mat(cycles_data)
+            except Exception as e:
+                st.error(f"파싱 실패: {e}")
+                st.stop()
+
+        if not soh_records:
+            st.error("방전 사이클 데이터를 찾지 못했습니다.")
+            st.stop()
+
+        st.success(f"✅ **{bat_name}** | 방전 사이클 {len(soh_records)}개 파싱 완료")
+
+        # ── 실측 SOH 곡선 ──────────────────────────
+        df_mat = pd.DataFrame(soh_records)
+        rated  = soh_records[0]['capacity_ah']
+
+        st.markdown('<div class="section-title">📈 실측 SOH 열화 곡선</div>',
+                    unsafe_allow_html=True)
+        fig_soh = go.Figure()
+        fig_soh.add_trace(go.Scatter(
+            x=df_mat['discharge_idx'], y=df_mat['soh_actual'],
+            mode='lines+markers', name='실측 SOH',
+            line=dict(color='#00d4aa', width=2), marker=dict(size=4)
+        ))
+        fig_soh.add_hline(y=80, line_dash='dash', line_color='#f0a500',
+                          annotation_text='SOH 80% (재사용 기준, PMC11033388)')
+        fig_soh.add_hline(y=50, line_dash='dash', line_color='#e05555',
+                          annotation_text='SOH 50% (해체 기준, PMC11033388)')
+        fig_soh.update_layout(
+            xaxis_title='방전 사이클 수', yaxis_title='SOH (%)',
+            template='plotly_dark', height=320,
+            margin=dict(l=0,r=0,t=10,b=0)
+        )
+        st.plotly_chart(fig_soh, use_container_width=True)
+
+        # ── BMS 모델 예측 vs 실측 비교 ─────────────
+        st.markdown('<div class="section-title">🤖 BMS 모델 예측 vs 실측 SOH</div>',
+                    unsafe_allow_html=True)
+
+        with st.spinner("예측 중..."):
+            preds = []
+            for row in soh_records:
+                # 내부저항: 실측값 or 사이클비로 자동 계산
+                r_ref_now = BAT_RESISTANCE[bat_type]
+                if row['internal_r'] is not None:
+                    ir = float(np.clip(row['internal_r'],
+                                      r_ref_now['r0'], r_ref_now['r_max']*1.5))
+                else:
+                    # 사이클비 기반 자동 계산
+                    cl_now  = BAT_PROPS[bat_type]['cycle_life']
+                    cr_now  = min(row['discharge_idx'] / cl_now, 1.3)
+                    ir = r_ref_now['r0'] + (r_ref_now['r_max']-r_ref_now['r0'])*cr_now
+
+                est_years = row['discharge_idx'] / 365.0
+                pred = predict_soh_bms(
+                    bms_models, bat_type,
+                    float(row['discharge_idx']), est_years, ir
+                )
+                preds.append(pred)
+
+        df_mat['soh_predicted'] = preds
+        df_mat['error'] = df_mat['soh_predicted'] - df_mat['soh_actual']
+
+        # 예측 vs 실측 그래프
+        fig_cmp = go.Figure()
+        fig_cmp.add_trace(go.Scatter(
+            x=df_mat['discharge_idx'], y=df_mat['soh_actual'],
+            mode='lines', name='실측 SOH',
+            line=dict(color='#00d4aa', width=2)
+        ))
+        fig_cmp.add_trace(go.Scatter(
+            x=df_mat['discharge_idx'], y=df_mat['soh_predicted'],
+            mode='lines', name='예측 SOH',
+            line=dict(color='#f0a500', width=2, dash='dot')
+        ))
+        fig_cmp.update_layout(
+            xaxis_title='방전 사이클 수', yaxis_title='SOH (%)',
+            template='plotly_dark', height=320,
+            margin=dict(l=0,r=0,t=10,b=0)
+        )
+        st.plotly_chart(fig_cmp, use_container_width=True)
+
+        # ── 오차 지표 ──────────────────────────────
+        mae  = float(df_mat['error'].abs().mean())
+        rmse = float(np.sqrt((df_mat['error']**2).mean()))
+        corr = float(df_mat['soh_actual'].corr(df_mat['soh_predicted']))
+
+        st.markdown('<div class="section-title">📊 예측 정확도</div>',
+                    unsafe_allow_html=True)
+        m1, m2, m3, m4 = st.columns(4)
+        for col, val, label, color in zip(
+            [m1, m2, m3, m4],
+            [f"{mae:.2f}%", f"{rmse:.2f}%", f"{corr:.4f}",
+             f"{len(soh_records)}개"],
+            ["MAE", "RMSE", "상관계수 (r)", "검증 사이클 수"],
+            ["#f0a500","#f0a500","#00d4aa","#00d4aa"]
+        ):
+            col.markdown(f"""
+            <div class="metric-card">
+                <div class="metric-val" style="color:{color}">{val}</div>
+                <div class="metric-label">{label}</div>
+            </div>""", unsafe_allow_html=True)
+
+        st.caption(
+            "📌 MAE(평균절대오차)·RMSE(평균제곱근오차): 낮을수록 정확 | "
+            "상관계수: 1에 가까울수록 실측과 동일한 패턴"
+        )
+
+        # ── 오차 분포 ──────────────────────────────
+        fig_err = go.Figure()
+        fig_err.add_trace(go.Scatter(
+            x=df_mat['discharge_idx'], y=df_mat['error'],
+            mode='lines+markers', name='예측 오차 (예측-실측)',
+            line=dict(color='#e05555', width=1.5), marker=dict(size=3)
+        ))
+        fig_err.add_hline(y=0, line_color='white', line_dash='dash')
+        fig_err.update_layout(
+            xaxis_title='방전 사이클 수', yaxis_title='오차 (%)',
+            template='plotly_dark', height=240,
+            margin=dict(l=0,r=0,t=10,b=0)
+        )
+        st.plotly_chart(fig_err, use_container_width=True)
+
+        # ── 상세 테이블 (처음 10개) ─────────────────
+        with st.expander("📋 사이클별 상세 데이터", expanded=False):
+            show_df = df_mat[['discharge_idx','soh_actual','soh_predicted',
+                              'error','capacity_ah']].copy()
+            show_df.columns = ['방전사이클','실측SOH(%)','예측SOH(%)',
+                               '오차(%)','용량(Ah)']
+            show_df = show_df.round(2)
+            st.dataframe(show_df, use_container_width=True, hide_index=True)
+
+    else:
+        st.info(
+            "👆 NASA .mat 파일을 업로드하면 실측 SOH와 예측 SOH를 비교합니다. "
+            "다운로드: kaggle.com → 'NASA Battery Dataset' 검색 → "
+            "B0005.mat / B0006.mat / B0007.mat / B0018.mat"
+        )
