@@ -314,11 +314,55 @@ BMS_FEATURE_LABELS = [
     '쿨롱 효율', '배터리 종류 (인코딩)', '설계 사이클 수명'
 ]
 
-def predict_soh_bms(models, features_dict):
-    """BMS 피처 딕셔너리 → SOH 예측 (앙상블)"""
-    row = [features_dict.get(col, 0) for col in BMS_FEATURE_COLS]
-    Xs  = models['scaler'].transform([row])
-    pred = (models['gb'].predict(Xs)[0] + models['rf'].predict(Xs)[0]) / 2
+def build_bms_features(bat_type, cycle, years, int_r):
+    """
+    핵심 3개 입력(사이클, 연수, 내부저항)으로 전체 피처 자동 계산
+    ─────────────────────────────────────────────────────────
+    문제: 충전시간·온도·전압강하 등을 기본값으로 고정하면
+          ML 모델이 사이클/연수를 무시하고 고정값만 보고 판단함
+    해결: 사이클+연수+내부저항으로 SOH를 먼저 추정하고,
+          추정된 SOH로 나머지 피처를 물리 모델에서 역산
+    ─────────────────────────────────────────────────────────
+    [근거]
+    - 사이클 열화: Ali et al. (2023), cycle_life 도달 시 SOH 80%
+    - 캘린더 열화: Ali et al. (2023), LFP <1%/년, NCM/NCA ~2%/년
+    - 내부저항 범위: NASA PCoE B0005~B0018 실측
+    """
+    cfg = BAT_PROPS[bat_type]
+    cl, cr = cfg['cycle_life'], cfg.get('calendar_aging_rate_pct', 2.0)
+    r0 = BAT_RESISTANCE[bat_type]['r0']
+    rm = BAT_RESISTANCE[bat_type]['r_max']
+
+    # 1단계: 사이클+캘린더 열화로 이론 SOH 계산 (Ali et al. 2023)
+    soh_cycle  = 100 - 20 * min(cycle / cl, 1.5)
+    soh_theory = max(50.0, soh_cycle - cr * years)
+
+    # 2단계: 내부저항 기반 SOH 추정
+    r_ratio   = (int_r - r0) / (rm - r0) if (rm - r0) > 0 else 0
+    soh_from_r = max(50.0, 100 - 20 * min(r_ratio, 1.3))
+
+    # 3단계: 가중 평균 (사이클+연수 60%, 내부저항 40%)
+    soh_est = soh_theory * 0.6 + soh_from_r * 0.4
+
+    # 4단계: 추정 SOH로 나머지 피처 물리 모델 역산
+    chg_t  = 3600 * (1 + (100 - soh_est) / 300)
+    t_rise = 5 + (100 - soh_est) / 12
+    v_drop = 0.05 + (100 - soh_est) / 1200
+    c_eff  = 0.99 - (100 - soh_est) / 6000
+
+    return [float(cycle), float(years), float(int_r),
+            chg_t, t_rise, v_drop, c_eff,
+            float(BAT_ENC[bat_type]), float(cl)]
+
+
+def predict_soh_bms(models, bat_type, cycle, years, int_r):
+    """
+    핵심 3개 입력 → 피처 자동 계산 → SOH 예측 (앙상블)
+    입력: bat_type, cycle(사이클 수), years(연수), int_r(내부저항 Ω)
+    """
+    feats = build_bms_features(bat_type, cycle, years, int_r)
+    Xs    = models['scaler'].transform([feats])
+    pred  = (models['gb'].predict(Xs)[0] + models['rf'].predict(Xs)[0]) / 2
     return round(float(np.clip(pred, 50, 100)), 1)
 
 def extract_bms_features_from_csv(df, bat_type):
@@ -768,8 +812,14 @@ elif method == "📟 BMS 기반 예측":
                     if not feat_list:
                         st.error("피처 추출 실패. 데이터를 확인해주세요.")
                     else:
-                        # 마지막 사이클 피처 사용 (가장 최근 상태)
-                        features_dict = feat_list[-1]
+                        last = feat_list[-1]
+                        # CSV도 핵심 3개만 추출해서 자동계산 경로 사용
+                        features_dict = {
+                            'bat_type': bat_type,
+                            'cycle':    last['cycle_count'],
+                            'years':    last['years'],
+                            'int_r':    last['internal_resistance_ohm'],
+                        }
                         st.success(f"✅ {len(feat_list)}개 사이클 데이터 추출 완료 — 최신 사이클 기준 예측")
 
                         # 사이클별 내부 저항 트렌드 시각화 (노화 지표)
@@ -801,81 +851,81 @@ elif method == "📟 BMS 기반 예측":
             f"말기 내부저항 {r_ref['r_max']}Ω (Ali et al. 2023; NASA PCoE)"
         )
         c1, c2 = st.columns(2)
+        # ── 핵심 3개 입력만 받고 나머지는 자동 계산 ──────────
+        # 충전시간·온도·전압강하 등을 기본값으로 고정하면
+        # ML 모델이 사이클/연수를 무시하는 문제가 발생함
+        # → 사이클+연수+내부저항으로 SOH를 역산한 뒤
+        #   나머지 피처를 물리 모델로 자동 계산
+        max_cyc      = float(props_now['cycle_life'] * 2)
+        default_cyc  = min(float(cycles), max_cyc)
+        cycle_ratio_now = min(default_cyc / props_now['cycle_life'], 1.3)
+        auto_r = round(r_ref['r0'] + (r_ref['r_max']-r_ref['r0'])*cycle_ratio_now, 4)
+
+        c1, c2 = st.columns(2)
         with c1:
-            # 사이클: 배터리 종류별 수명 2배까지 입력 가능
-            max_cyc     = float(props_now['cycle_life'] * 2)
-            default_cyc = min(float(cycles), max_cyc)  # value>max 에러 방지
             cycle_cnt = st.number_input(
                 f"사이클 수 (설계 수명: {props_now['cycle_life']:,}회)",
                 0.0, max_cyc, default_cyc, step=10.0,
-                help=f"{bat_type} 설계 사이클 수명 기준 (Ali et al. 2023)"
-            )
-            charge_t = st.number_input(
-                "충전 시간 (s)", 600.0, 7200.0, 3600.0, step=60.0,
-                help="완충까지 소요 시간. 노화 시 증가"
-            )
-            temp_rise_v = st.number_input(
-                "온도 상승폭 (°C)", 0.0, 20.0, 5.0, step=0.5,
-                help="충방전 중 온도 상승폭. 노화 시 증가"
+                help=f"{bat_type} 설계 수명 기준 (Ali et al. 2023) | "
+                     f"설계 수명 도달 시 SOH 80%"
             )
         with c2:
-            # ── 내부 저항 자동 계산 ──────────────────────────
-            # 사이클비에 따라 r0→r_max 선형 증가 (NASA PCoE 실측 기반)
-            # 사용자가 사이클 수를 바꾸면 기본값이 자동으로 갱신됨
-            cycle_ratio_now = min(cycle_cnt / props_now['cycle_life'], 1.3)
-            auto_r = round(
-                r_ref['r0'] + (r_ref['r_max'] - r_ref['r0']) * cycle_ratio_now,
-                4
-            )
-            st.caption(
-                f"💡 사이클비 {round(cycle_ratio_now*100)}% 기준 "
-                f"자동 계산 내부저항: **{auto_r} Ω** "
-                f"(신품 {r_ref['r0']} → 말기 {r_ref['r_max']} Ω, NASA PCoE)"
+            # 내부저항: 사이클비 기반 자동 계산값을 기본으로 제공
+            cycle_ratio_input = min(cycle_cnt / props_now['cycle_life'], 1.3)
+            auto_r_input = round(
+                r_ref['r0'] + (r_ref['r_max']-r_ref['r0'])*cycle_ratio_input, 4
             )
             internal_r_v = st.number_input(
-                "내부 저항 (Ω) — 사이클에 따라 자동 계산",
+                f"내부 저항 (Ω) | 신품 {r_ref['r0']} → 말기 {r_ref['r_max']}",
                 float(r_ref['r0']), float(r_ref['r_max'] * 1.5),
-                float(auto_r), step=0.005,
-                help=f"사이클비 {round(cycle_ratio_now*100)}% 반영값. 직접 수정도 가능"
+                float(auto_r_input), step=0.005,
+                help="사이클 수 기준 자동 계산값. BMS 실측값이 있으면 직접 입력 (NASA PCoE)"
             )
-            voltage_drop_v = st.number_input(
-                "전압 강하 (V)", 0.0, 0.5, 0.05, step=0.005,
-                help="충전 말기 전압 강하. 노화 시 증가"
-            )
-            coulomb_eff = st.slider(
-                "쿨롱 효율 (%)", 90, 100, 99, step=1,
-                help="방전 용량 / 충전 용량 × 100. 노화 시 감소"
-            ) / 100
 
-        features_dict = {
-            'cycle_count':             float(cycle_cnt),
-            'years':                   float(years),
-            'internal_resistance_ohm': float(internal_r_v),
-            'charge_time_s':           float(charge_t),
-            'temp_rise_c':             float(temp_rise_v),
-            'voltage_drop_v':          float(voltage_drop_v),
-            'coulombic_efficiency':    float(coulomb_eff),
-            'bat_type_enc':            float(BAT_ENC[bat_type]),
-            'cycle_life':              float(props_now['cycle_life']),
+        st.caption(
+            f"💡 충전시간·온도·전압강하는 입력값 기반으로 자동 계산됩니다. "
+            f"사이클·연수·내부저항이 SOH 예측의 핵심 지표입니다."
+        )
+
+        # features_dict에 핵심 3개만 저장 (predict_soh_bms에서 자동 계산)
+        manual_input = {
+            'bat_type': bat_type,
+            'cycle':    float(cycle_cnt),
+            'years':    float(years),
+            'int_r':    float(internal_r_v),
         }
+        features_dict = manual_input  # predict_soh_bms가 직접 처리
 
     # ── 예측 실행 ───────────────────────────────
     if features_dict:
         st.divider()
 
-        # 입력 피처 요약 테이블
-        with st.expander("📊 입력 피처 확인", expanded=False):
-            feat_df = pd.DataFrame({
-                '항목':  BMS_FEATURE_LABELS,
-                '값':    [round(features_dict[c], 4) for c in BMS_FEATURE_COLS],
-                '설명':  ['누적 충방전 횟수 (Ali et al. 2023 기준)', '실제 사용 연수',
-                          '내부 저항 — 노화 핵심 지표 (NASA PCoE)', '완충 소요 시간',
-                          '충방전 중 온도 상승폭', '충전 말기 전압 강하',
-                          '방전/충전 용량 비율', '배터리 종류 인코딩', '설계 사이클 수명']
-            })
-            st.dataframe(feat_df, use_container_width=True, hide_index=True)
+        # 입력 요약
+        with st.expander("📊 입력값 확인", expanded=False):
+            fd = features_dict
+            cfg = BAT_PROPS[fd['bat_type']]
+            cl = cfg['cycle_life']
+            cr = cfg.get('calendar_aging_rate_pct', 2.0)
+            soh_theory = max(50, 100 - 20*min(fd['cycle']/cl, 1.5) - cr*fd['years'])
+            feats_auto = build_bms_features(fd['bat_type'], fd['cycle'], fd['years'], fd['int_r'])
+            st.markdown(f"""
+| 항목 | 입력값 | 근거 |
+|---|---|---|
+| 배터리 종류 | {fd['bat_type']} | 선택값 |
+| 사이클 수 | {fd['cycle']:.0f}회 | 사용자 입력 |
+| 사용 연수 | {fd['years']:.1f}년 | 사용자 입력 |
+| 내부 저항 | {fd['int_r']:.4f} Ω | 사용자 입력 (NASA PCoE) |
+| 이론 SOH (사이클+캘린더) | {soh_theory:.1f}% | Ali et al. (2023) |
+| 자동계산 충전시간 | {feats_auto[3]:.0f} s | 물리 모델 역산 |
+| 자동계산 온도 상승폭 | {feats_auto[4]:.1f} °C | 물리 모델 역산 |
+| 자동계산 전압 강하 | {feats_auto[5]:.4f} V | 물리 모델 역산 |
+            """)
 
-        soh = predict_soh_bms(bms_models, features_dict)
+        fd = features_dict
+        soh = predict_soh_bms(
+            bms_models,
+            fd['bat_type'], fd['cycle'], fd['years'], fd['int_r']
+        )
         render_result(soh, "BMS ML 예측 (NASA PCoE 기반, 앙상블)", bat_type,
                       years, cycles, voltage, "📟 BMS 기반")
 
