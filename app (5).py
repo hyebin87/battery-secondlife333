@@ -70,6 +70,19 @@ BAT_RESISTANCE = {
 
 BAT_ENC = {"NCM": 0, "LFP": 1, "NCA": 2, "LCO": 3}
 
+# ─────────────────────────────────────────────
+# 배터리별 페널티 가중치
+# 배터리 화학 특성에 따른 열화 속도 차이 반영
+# cycle_multiplier: 사이클비율 × N% 페널티
+# age_multiplier:   연수 × N% 페널티
+# ─────────────────────────────────────────────
+PENALTY_WEIGHTS = {
+    "LFP": {"cycle_multiplier": 15, "age_multiplier": 1.0, "desc": "안정적 화학 (LiFePO₄)"},
+    "NCM": {"cycle_multiplier": 20, "age_multiplier": 2.0, "desc": "표준 니켈-코발트-망간"},
+    "NCA": {"cycle_multiplier": 22, "age_multiplier": 2.5, "desc": "고에너지 니켈-코발트-알루미늄"},
+    "LCO": {"cycle_multiplier": 25, "age_multiplier": 3.0, "desc": "고에너지 리튬-코발트 (불안정)"},
+}
+
 def get_soh_tier(soh):
     if soh > 80:   return "reuse"
     elif soh > 50: return "repurpose"
@@ -486,65 +499,76 @@ def compute_soh_from_mat(cycles_data):
 # ═══════════════════════════════════════════════
 def get_recommendations(health, years, cycles, bat_type, voltage):
     """
-    활용처 추천 적합도 계산
+    배터리 2차 수명 활용처 추천 (배터리별 차등 페널티 적용)
     ─────────────────────────────────────────────
-    SOH 기준: PMC11033388
-      ESS/그리드 SOH 70~80% / UPS 비상전원 SOH 50% 이상 (grade C)
+    조정된 SOH = 기본 SOH - 사이클 페널티 - 연수 페널티 - 전압 페널티
 
-    적합도 페널티:
-    - 사이클 페널티: 사이클비 × 10, 최대 10점 상한
-    - 캘린더 열화: 연수 × 열화율(Ali et al. 2023), 최대 10점 상한
-    - 전압 이탈: 공칭전압 ±0.3V 초과 시만 적용
+    페널티는 배터리 화학 특성에 따라 차등 적용:
+    - LFP: 사이클 15%, 연 1%  (안정적)
+    - NCM: 사이클 20%, 연 2%  (표준)
+    - NCA: 사이클 22%, 연 2.5% (불안정)
+    - LCO: 사이클 25%, 연 3%  (매우 불안정)
 
-    활용처별 최소 SOH:
-    - 태양광 ESS / 가정용 ESS: 70% (PMC11033388; IEC 62933)
-    - 통신기지국 / EV 보조: 60% (Martinez-Laserna et al. 2018)
-    - UPS 비상전원: 50% grade C (PMC11033388; IEC 62619)
+    활용처별 최소 SOH (조정값 기준):
+    - 태양광 연계 ESS: 70% (Edge et al. 2023)
+    - 가정용 ESS:      70% (Edge et al. 2023; UL 1974)
+    - 통신기지국 백업: 60% (Martinez-Laserna et al. 2018)
+    - UPS 비상전원:    50% (Edge et al. 2023)
+    - 전기차 보조:     50% (Edge et al. 2023)
     ─────────────────────────────────────────────
     """
-    props       = BAT_PROPS[bat_type]
-    cycle_ratio = cycles / props['cycle_life']
-    cal_rate    = props.get('calendar_aging_rate_pct', 2.0)
+    props   = BAT_PROPS[bat_type]
+    weights = PENALTY_WEIGHTS[bat_type]
 
-    cycle_penalty = min(cycle_ratio * 10, 10)
-    cal_penalty   = min(years * cal_rate, 10)
-    base          = health - cycle_penalty - cal_penalty
+    cycle_ratio   = cycles / props['cycle_life']
+    cycle_penalty = min(cycle_ratio * weights['cycle_multiplier'], 25)
+    age_penalty   = min(years * weights['age_multiplier'], 20)
     v_diff        = abs(voltage - props['nominal_v'])
-    if v_diff > 0.3:
-        base -= v_diff * 10
-    tier     = get_soh_tier(health)
-    lfp_note = ""
-    if bat_type == "LFP" and health < props.get('eis_threshold', 60):
-        lfp_note = f" ※ LFP SOH {props['eis_threshold']}% 미만 → 임피던스 급증 구간"
+    v_penalty     = min((v_diff / 0.3) * 10, 10) if v_diff > 0 else 0
+
+    adjusted_health = health - cycle_penalty - age_penalty - v_penalty
 
     apps = [
-        dict(name="태양광 연계 ESS", icon="☀️",
-             desc="재생에너지 저장. 낮은 C-rate, 1일 1~2회 충방전." + lfp_note,
-             ref="PMC11033388 (ESS SOH 70~80%); IEC 62933",
-             score=max(0, base+5), condition=health >= 70,
-             tier_label="재사용 ✅" if tier == "reuse" else "재활용 ♻️"),
-        dict(name="가정용 ESS", icon="🏠",
-             desc="저출력 장기 사용. 태양광 잉여전력 저장." + lfp_note,
-             ref="PMC11033388; UL 1974",
-             score=max(0, base), condition=health >= 70,
-             tier_label="재사용 ✅" if tier == "reuse" else "재활용 ♻️"),
-        dict(name="통신기지국 백업전원", icon="📡",
-             desc="간헐적 방전. 부동충전 위주로 배터리 부담 낮음.",
-             ref="Martinez-Laserna et al. (2018); PMC11033388",
-             score=max(0, base-5), condition=health >= 60,
-             tier_label="재활용 ♻️"),
-        dict(name="전기차 보조 배터리", icon="🚗",
-             desc="저/중 출력. 일일 충방전 100회 이상 가능.",
-             ref="PMC11033388; Frontiers in Energy Research (2023)",
-             score=max(0, base-10), condition=health >= 60,
-             tier_label="재활용 ♻️"),
-        dict(name="무정전전원장치 (UPS)", icon="⚡",
-             desc="간헐적 방전. 응급 상황 대비. (grade C, SOH 50% 이상)",
-             ref="PMC11033388 (UPS SOH 50% 이상, grade C); IEC 62619",
-             score=max(0, base-15), condition=health >= 50 and tier != "recycle",
-             tier_label="재활용 ♻️"),
+        {
+            "name": "전력망 연계 ESS (Grid ESS)", "icon": "🔋",
+            "desc": "태양광/풍력 연계. 일일 1~2회 충방전. 5~10년 운영 기대.",
+            "ref": "Edge et al. (2023); IEC 62933",
+            "score": max(0, adjusted_health - 10),
+            "condition": adjusted_health >= 70,
+        },
+        {
+            "name": "태양광 주택용 ESS", "icon": "☀️",
+            "desc": "가정용 태양광 연계 저장. 낮은 C-rate, 25년 설계수명.",
+            "ref": "Edge et al. (2023); IEC 62933",
+            "score": max(0, adjusted_health - 5),
+            "condition": adjusted_health >= 70,
+        },
+        {
+            "name": "무정전전원장치 (UPS)", "icon": "⚡",
+            "desc": "비상/백업 전원. 간헐적 방전. 낮은 사이클 스트레스.",
+            "ref": "Edge et al. (2023), PMC11033388",
+            "score": max(0, adjusted_health),
+            "condition": adjusted_health >= 50,
+        },
+        {
+            "name": "통신기지국 백업전원", "icon": "📡",
+            "desc": "기지국 정전 대비. 부동충전 위주, 연간 수회 방전.",
+            "ref": "EverExceed (업계표준); Martinez-Laserna et al. (2018)",
+            "score": max(0, adjusted_health - 15),
+            "condition": adjusted_health >= 50,
+        },
+        {
+            "name": "전기차 보조 배터리", "icon": "🚗",
+            "desc": "저출력 범위. 일일 충방전 100회 이상 가능.",
+            "ref": "Circunomics; Frontiers Chemistry",
+            "score": max(0, adjusted_health - 20),
+            "condition": adjusted_health >= 50,
+        },
     ]
-    return [a for a in apps if a['condition'] and a['score'] > 0]
+
+    recs_filtered = [a for a in apps if a['condition'] and a['score'] > 0]
+    recs_sorted   = sorted(recs_filtered, key=lambda x: x['score'], reverse=True)
+    return recs_sorted, adjusted_health, weights['desc']
 
 def safety_eval(health, years, cycles, bat_type, voltage):
     """
@@ -644,24 +668,34 @@ def render_result(soh_final, soh_source, bat_type, years, cycles, voltage, mode_
         <span style="font-size:14px; color:#ccc; margin-left:12px;">{s_desc}</span>
     </div>""", unsafe_allow_html=True)
 
+    # 조정된 SOH 계산 및 추천
+    recs, adjusted_health, battery_desc = get_recommendations(soh_final, years, cycles, bat_type, voltage)
+    adjustment_pct = soh_final - adjusted_health
+    if adjustment_pct > 0.1:
+        st.markdown('<div class="section-title">📊 조정된 SOH 분석</div>', unsafe_allow_html=True)
+        st.info(
+            f"**{battery_desc}**\n\n"
+            f"기본 SOH: {soh_final:.1f}% → 조정된 SOH: **{adjusted_health:.1f}%**\n\n"
+            f"*(사이클 {int(cycles)}회, 연수 {years}년, 전압 {voltage}V 고려, 페널티: -{adjustment_pct:.1f}%)*"
+        )
+
     st.markdown('<div class="section-title">🎯 추천 활용처</div>', unsafe_allow_html=True)
-    st.caption("📌 PMC11033388: ESS/그리드 SOH 70~80%, UPS 비상전원 SOH 50% 이상 (grade C)")
-    recs = get_recommendations(soh_final, years, cycles, bat_type, voltage)
-    if not recs:
-        st.error("❌ 모든 활용처 기준 미달 — 해체(Recycle) 공정 투입 권장 (SOH ≤ 50%, PMC11033388)")
+    st.caption("📌 활용처별 기준: 조정된 SOH (배터리별 차등 페널티 포함) | Edge et al. (2023); Martinez-Laserna et al. (2018)")
+
+    if s_txt.startswith("위험"):
+        st.error("❌ **위험 상태** — 2차 활용처 불가\n\n해체 필요. 배터리를 즉시 재활용 공정에 투입하세요.")
+    elif not recs:
+        st.error("❌ 모든 활용처 기준 미달 — 재활용 공정 투입 권장 (조정 SOH 50% 미만)")
     else:
         for i, rec in enumerate(recs):
             cls  = "rec-card top-card" if i == 0 else "rec-card"
             rank = "✦ 최우선 추천" if i == 0 else f"{i+1}순위 추천"
             st.markdown(f"""
             <div class="{cls}">
-                <div style="font-size:16px; font-weight:600;">
-                    {rec['icon']} {rec['name']}
-                    <span style="font-size:12px; color:#aaa; margin-left:8px;">{rec['tier_label']}</span>
-                </div>
-                <div style="font-size:12px; color:#aaa;">{rank} · 적합도 {round(rec['score'])}점</div>
-                <div style="font-size:13px; color:#bbb; margin-top:6px;">{rec['desc']}</div>
-                <div style="font-size:11px; color:#666; margin-top:4px;">📚 {rec['ref']}</div>
+                <div style="font-size:18px; font-weight:900; color:#FFFFFF; margin-bottom:8px;">{rec['icon']} {rec['name']}</div>
+                <div style="font-size:13px; color:#00FF88; margin-bottom:8px; font-weight:700;">{rank} · 적합도 {round(rec['score'])}점</div>
+                <div style="font-size:14px; color:#DDDDDD; margin-bottom:6px; line-height:1.6;">{rec['desc']}</div>
+                <div style="font-size:12px; color:#AAAAAA;">📚 {rec['ref']}</div>
             </div>""", unsafe_allow_html=True)
 
     st.divider()
