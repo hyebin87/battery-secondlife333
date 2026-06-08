@@ -779,22 +779,23 @@ with st.sidebar:
     st.markdown("### 📋 배터리 기본 정보")
     bat_type = st.selectbox("배터리 종류", ["LFP", "NCM", "NCA", "LCO"])
 
-    # BMS 기반 예측 모드일 때 파일에서 자동 추출된 값 사용
-    _auto_years  = st.session_state.get('auto_years',  None)
-    _auto_cycles = st.session_state.get('auto_cycles', None)
+    # BMS 기반 예측 모드: 연수·사이클은 파일마다 달라서 사이드바 슬라이더 불필요
+    _is_bms_mode = st.session_state.get('current_method', '') == '🏭 BMS 기반 예측'
 
-    if _auto_years is not None and _auto_cycles is not None:
-        st.caption("🔄 아래 값은 업로드된 BMS 파일에서 자동 추출됨")
-        years  = _auto_years
-        cycles = _auto_cycles
+    if _is_bms_mode:
         st.markdown(
-            f"<div style=\"background:#0d2b1a; border:1px solid #00d4aa; border-radius:8px;"
-            f"padding:10px 14px; margin-bottom:8px;\">"
-            f"<span style=\"color:#00d4aa; font-size:12px;\">📂 파일 기반 자동 적용</span><br>"
-            f"<span style=\"color:#fff; font-size:15px; font-weight:700;\">"
-            f"사용 연수 {years}년 &nbsp;|&nbsp; 충방전 {cycles}회</span></div>",
+            "<div style=\"background:#111827; border:1px solid #374151; border-radius:8px;"
+            "padding:10px 14px; margin-bottom:8px;\">"
+            "<span style=\"color:#9ca3af; font-size:12px;\">📂 사용 연수 · 충방전 횟수</span><br>"
+            "<span style=\"color:#00d4aa; font-size:13px;\">"
+            "파일별로 자동 추출됩니다<br>"
+            "<span style=\"color:#6b7280; font-size:11px;\">"
+            "각 배터리마다 값이 달라 결과 테이블에서 확인하세요</span>"
+            "</span></div>",
             unsafe_allow_html=True
         )
+        years  = 0
+        cycles = 0
     else:
         years  = st.slider("사용 연수 (년)", 0, 15, 0)
         cycles = st.slider(
@@ -815,6 +816,9 @@ with st.sidebar:
             "BMS: 여러 배터리 .mat/.csv 일괄 분석 → 사이클·연수 자동 추출 → 엑셀 다운로드"
         )
     )
+
+# 현재 모드 저장 (사이드바 조건 분기용)
+st.session_state['current_method'] = method
 
 with st.expander("ℹ️ SOH 판정 기준 (PMC11033388)", expanded=False):
     st.markdown("""
@@ -1022,9 +1026,7 @@ elif method == "🏭 BMS 기반 예측":
                     cycle_cnt  = last['discharge_idx']
                     est_years  = round(cycle_cnt / 365.0, 1)
                     capacity   = round(last['capacity_ah'], 4)
-                    # 사이드바 자동 갱신용 저장
-                    st.session_state['auto_years']  = est_years
-                    st.session_state['auto_cycles'] = cycle_cnt
+
                 else:
                     df_b = pd.read_csv(io.BytesIO(raw))
                     col_map = {}
@@ -1152,9 +1154,6 @@ elif method == "🏭 BMS 기반 예측":
             with st.expander(f"⚠️ 처리 실패 파일 {len(errors)}개", expanded=False):
                 st.dataframe(pd.DataFrame(errors), use_container_width=True, hide_index=True)
     else:
-        # 파일이 없으면 자동값 초기화 (다른 탭으로 이동 후 돌아올 때)
-        st.session_state.pop('auto_years',  None)
-        st.session_state.pop('auto_cycles', None)
         st.info(
             "👆 .mat 또는 CSV 파일을 업로드하면 분석이 시작됩니다.\n"
             ".mat: 사이클수·연수 자동 추출 후 사이드바에 반영 | "
