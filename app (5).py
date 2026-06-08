@@ -369,13 +369,35 @@ def predict_soh_bms(models, bat_type, cycle, years, int_r):
 # 출처: NASA PCoE Battery Dataset
 #   ti.arc.nasa.gov/tech/dash/groups/pcoe/prognostic-data-repository/
 # ═══════════════════════════════════════════════
+def _safe_get(obj, key, default=None):
+    """
+    numpy structured array / dict / object 구분 없이 필드 접근
+    NASA .mat simplify_cells 결과가 버전에 따라 타입이 달라지는 문제 대응
+    """
+    try:
+        if isinstance(obj, dict):
+            return obj.get(key, default)
+        elif hasattr(obj, 'dtype') and obj.dtype.names and key in obj.dtype.names:
+            val = obj[key]
+            # shape () → 스칼라, shape (1,) → 첫 요소
+            val = np.squeeze(val)
+            if val.shape == ():
+                return val.item()
+            return val
+        elif hasattr(obj, key):
+            return getattr(obj, key)
+    except Exception:
+        pass
+    return default
+
 def parse_nasa_mat(file_bytes):
     """NASA PCoE .mat 파일 파싱 (scipy v7.3 이하 / h5py HDF5 v7.3)"""
     try:
         import scipy.io
-        mat = scipy.io.loadmat(io.BytesIO(file_bytes), simplify_cells=True)
+        # simplify_cells=False로 raw 구조 먼저 받아서 직접 파싱
+        mat = scipy.io.loadmat(io.BytesIO(file_bytes), simplify_cells=False)
         bat_name = [k for k in mat.keys() if k.startswith('B')][0]
-        return _parse_scipy_cycles(mat[bat_name]['cycle']), bat_name
+        return _parse_scipy_cycles_raw(mat[bat_name]), bat_name
     except Exception:
         pass
     try:
@@ -392,32 +414,98 @@ def parse_nasa_mat(file_bytes):
     except Exception as e:
         raise ValueError(f"mat 파일 파싱 실패: {e}")
 
+def _parse_scipy_cycles_raw(bat_struct):
+    """
+    scipy.io.loadmat(simplify_cells=False) 결과에서 사이클 파싱
+    NASA PCoE 구조: bat_struct['cycle'][0,i] 또는 bat_struct['cycle'][i]
+    """
+    results = []
+    try:
+        cycles_raw = bat_struct['cycle']
+        # (1, N) 또는 (N,) 형태 모두 대응
+        if cycles_raw.ndim == 2:
+            cycles_raw = cycles_raw[0]
+    except Exception:
+        return results
+
+    for i in range(len(cycles_raw)):
+        try:
+            c = cycles_raw[i]
+            # type 필드
+            ctype_raw = c['type']
+            if hasattr(ctype_raw, 'flat'):
+                ctype = str(list(ctype_raw.flat)[0]).strip().lower()
+            else:
+                ctype = str(ctype_raw).strip().lower()
+
+            # data 필드
+            data = c['data']
+            if hasattr(data, 'flat'):
+                data = list(data.flat)[0]
+
+            entry = {'cycle_idx': i, 'type': ctype, 'capacity_ah': None, 'internal_r': None}
+
+            def get_arr(field):
+                try:
+                    val = data[field]
+                    return np.atleast_1d(val.flatten())
+                except Exception:
+                    return np.array([])
+
+            v  = get_arr('Voltage_measured')
+            a  = get_arr('Current_measured')
+            t  = get_arr('Temperature_measured')
+            ts = get_arr('Time')
+
+            entry['voltage_mean']  = float(np.mean(v))       if len(v)  > 0 else 0.0
+            entry['current_mean']  = float(np.mean(np.abs(a))) if len(a) > 0 else 0.0
+            entry['temp_mean']     = float(np.mean(t))       if len(t)  > 0 else 25.0
+            entry['charge_time_s'] = float(ts[-1] - ts[0])   if len(ts) > 1 else 0.0
+
+            if ctype == 'discharge':
+                cap = get_arr('Capacity')
+                if len(cap) > 0:
+                    entry['capacity_ah'] = float(cap.flat[0])
+            if ctype == 'impedance':
+                re = get_arr('Re')
+                if len(re) > 0:
+                    entry['internal_r'] = float(re.flat[0])
+
+            results.append(entry)
+        except Exception:
+            continue
+    return results
+
 def _parse_scipy_cycles(cycles_raw):
+    """레거시 호환용 (simplify_cells=True 경로, 현재 미사용)"""
     results = []
     if not hasattr(cycles_raw, '__iter__'):
         cycles_raw = [cycles_raw]
     for i, c in enumerate(cycles_raw):
         try:
-            ctype = str(c.get('type', '')).strip().lower()
-            data  = c.get('data', {})
-            if not data: continue
+            ctype = str(_safe_get(c, 'type', '')).strip().lower()
+            data  = _safe_get(c, 'data', {})
+            if data is None: continue
             entry = {'cycle_idx': i, 'type': ctype, 'capacity_ah': None, 'internal_r': None}
-            v  = np.atleast_1d(data.get('Voltage_measured', []))
-            a  = np.atleast_1d(data.get('Current_measured', []))
-            t  = np.atleast_1d(data.get('Temperature_measured', []))
-            ts = np.atleast_1d(data.get('Time', []))
-            entry['voltage_mean']  = float(np.mean(v))  if len(v)  else 0.0
-            entry['current_mean']  = float(np.mean(np.abs(a))) if len(a) else 0.0
-            entry['temp_mean']     = float(np.mean(t))  if len(t)  else 25.0
-            entry['charge_time_s'] = float(ts[-1]-ts[0]) if len(ts) > 1 else 0.0
+            def get_arr(field):
+                val = _safe_get(data, field, [])
+                return np.atleast_1d(val) if val is not None and len(np.atleast_1d(val)) > 0 else np.array([])
+            v  = get_arr('Voltage_measured')
+            a  = get_arr('Current_measured')
+            t  = get_arr('Temperature_measured')
+            ts = get_arr('Time')
+            entry['voltage_mean']  = float(np.mean(v))       if len(v)  > 0 else 0.0
+            entry['current_mean']  = float(np.mean(np.abs(a))) if len(a) > 0 else 0.0
+            entry['temp_mean']     = float(np.mean(t))       if len(t)  > 0 else 25.0
+            entry['charge_time_s'] = float(ts[-1]-ts[0])     if len(ts) > 1 else 0.0
             if ctype == 'discharge':
-                cap = data.get('Capacity', None)
-                if cap is not None:
-                    entry['capacity_ah'] = float(np.atleast_1d(cap).flat[0])
+                cap = get_arr('Capacity')
+                if len(cap) > 0:
+                    entry['capacity_ah'] = float(cap.flat[0])
             if ctype == 'impedance':
-                re = data.get('Re', None)
-                if re is not None:
-                    entry['internal_r'] = float(np.atleast_1d(re).flat[0])
+                re = get_arr('Re')
+                if len(re) > 0:
+                    entry['internal_r'] = float(re.flat[0])
             results.append(entry)
         except:
             continue
@@ -1016,8 +1104,8 @@ elif method == "🏭 배치 처리 (기업용)":
                 tier        = get_soh_tier(soh_val)
                 tier_text, _ = TIER_META[tier]
                 props_b     = BAT_PROPS[batch_bat_type]
-                recs        = get_recommendations(soh_val, est_years, cycle_cnt,
-                                                  batch_bat_type, batch_voltage)
+                recs, adjusted_h, _ = get_recommendations(soh_val, est_years, cycle_cnt,
+                                                           batch_bat_type, batch_voltage)
                 top_rec     = recs[0]['name'] if recs else "해당 없음 (해체 권장)"
                 cycle_ratio = cycle_cnt / props_b['cycle_life']
                 cal_loss    = est_years * props_b.get('calendar_aging_rate_pct', 2.0)
