@@ -369,54 +369,72 @@ def predict_soh_bms(models, bat_type, cycle, years, int_r):
 # 출처: NASA PCoE Battery Dataset
 #   ti.arc.nasa.gov/tech/dash/groups/pcoe/prognostic-data-repository/
 # ═══════════════════════════════════════════════
-def _unwrap(val):
-    """
-    중첩된 numpy object array를 재귀적으로 unwrap해서 실제 값 반환
-    NASA .mat 파일은 모든 필드가 object array로 중첩돼 있음
-    예: array([[array([[3.7, 3.6, ...]])]], dtype=object) → array([3.7, 3.6, ...])
-    """
-    while isinstance(val, np.ndarray) and val.dtype == object and val.size == 1:
-        val = val.flat[0]
-    return val
-
-def _extract_str(val):
-    """중첩 object array에서 문자열 추출"""
-    val = _unwrap(val)
-    if isinstance(val, (str, np.str_)):
-        return str(val).strip().lower()
-    if isinstance(val, np.ndarray):
-        if val.size == 0: return ''
-        return str(val.flat[0]).strip().lower()
-    return str(val).strip().lower()
-
-def _extract_arr(val):
-    """중첩 object array에서 숫자 배열 추출"""
-    val = _unwrap(val)
-    if isinstance(val, np.ndarray):
-        return val.flatten().astype(float)
-    try:
-        return np.atleast_1d(float(val))
-    except Exception:
-        return np.array([])
-
 def parse_nasa_mat(file_bytes):
     """
-    NASA PCoE .mat 파일 파싱
-    실제 구조: mat['B000X'] → (1,1) object array → [0,0] → structured array
-               ['cycle'] → (1,N) object array → [0,i] → 각 사이클
-               ['type']  → (1,1) object array → 'charge'/'discharge'/'impedance'
-               ['data']  → (1,1) object array → structured array (측정값)
+    NASA PCoE .mat 파일 파싱 (B0005~B0018 실제 구조 기반)
+    확인된 구조:
+      mat['B000X']       → shape (1,1), dtype [('cycle','O')]
+      mat['B000X'][0,0]  → numpy.void, field: 'cycle'
+      ['cycle']          → shape (1,N)
+      ['cycle'][0,i]     → numpy.void
+        ['type']         → shape (1,), dtype '<U9' → flat[0] = 'charge'/'discharge'/'impedance'
+        ['data']         → shape (1,1) → [0,0] = numpy.void (측정값)
+          ['Capacity']   → shape (1,1) float64 (discharge 전용, 마지막값 = 총 방전용량)
+          ['Re']         → shape (1,1) float64 (impedance 전용)
     """
     try:
         import scipy.io
-        mat = scipy.io.loadmat(io.BytesIO(file_bytes), simplify_cells=False)
-        bat_name = [k for k in mat.keys() if k.startswith('B')][0]
-        bat_raw  = mat[bat_name]
-        # mat['B000X'] 가 (1,1) shape object array인 경우 unwrap
-        bat_struct = _unwrap(bat_raw)
-        return _parse_mat_struct(bat_struct), bat_name
+        mat      = scipy.io.loadmat(io.BytesIO(file_bytes), simplify_cells=False)
+        bat_name = [k for k in mat.keys() if not k.startswith('_')][0]
+        b0       = mat[bat_name][0, 0]
+        cyc      = b0['cycle']            # shape (1, N)
+        results  = []
+
+        for i in range(cyc.shape[1]):
+            try:
+                c     = cyc[0, i]
+                ctype = str(c['type'].flat[0]).strip().lower()
+                data  = c['data'][0, 0]
+
+                def get_arr(field, _d=data):
+                    try:
+                        return np.array(_d[field]).flatten().astype(float)
+                    except Exception:
+                        return np.array([])
+
+                v  = get_arr('Voltage_measured')
+                a  = get_arr('Current_measured')
+                t  = get_arr('Temperature_measured')
+                ts = get_arr('Time')
+
+                entry = {
+                    'cycle_idx':    i,
+                    'type':         ctype,
+                    'capacity_ah':  None,
+                    'internal_r':   None,
+                    'voltage_mean': float(np.mean(v))         if len(v)  > 0 else 0.0,
+                    'current_mean': float(np.mean(np.abs(a))) if len(a)  > 0 else 0.0,
+                    'temp_mean':    float(np.mean(t))         if len(t)  > 0 else 25.0,
+                    'charge_time_s':float(ts[-1] - ts[0])     if len(ts) > 1 else 0.0,
+                }
+                if ctype == 'discharge':
+                    cap = get_arr('Capacity')
+                    if len(cap) > 0:
+                        entry['capacity_ah'] = float(cap.flat[-1])
+                if ctype == 'impedance':
+                    re = get_arr('Re')
+                    if len(re) > 0:
+                        entry['internal_r'] = float(re.flat[0])
+
+                results.append(entry)
+            except Exception:
+                continue
+        return results, bat_name
+
     except Exception:
         pass
+
+    # HDF5 fallback (v7.3 포맷)
     try:
         import h5py, tempfile
         with tempfile.NamedTemporaryFile(delete=False, suffix='.mat') as tmp:
@@ -424,84 +442,14 @@ def parse_nasa_mat(file_bytes):
             tmp_path = tmp.name
         try:
             with h5py.File(tmp_path, 'r') as f:
-                bat_name = [k for k in f.keys() if k.startswith('B')][0]
+                bat_name = [k for k in f.keys() if not k.startswith('#')][0]
                 return _parse_hdf5_cycles(f[bat_name]), bat_name
         finally:
             os.unlink(tmp_path)
     except Exception as e:
         raise ValueError(f"mat 파일 파싱 실패: {e}")
 
-def _parse_mat_struct(bat_struct):
-    """
-    NASA PCoE structured array에서 사이클 파싱
-    bat_struct['cycle'] → (1,N) 또는 (N,) object array
-    """
-    results = []
-    try:
-        cycles_raw = bat_struct['cycle']
-        # (1, N) → 1차원으로
-        if isinstance(cycles_raw, np.ndarray) and cycles_raw.ndim == 2:
-            cycles_raw = cycles_raw[0]
-        elif isinstance(cycles_raw, np.ndarray) and cycles_raw.dtype == object and cycles_raw.size == 1:
-            cycles_raw = cycles_raw.flat[0]
-            if isinstance(cycles_raw, np.ndarray) and cycles_raw.ndim == 2:
-                cycles_raw = cycles_raw[0]
-    except Exception:
-        return results
 
-    for i in range(len(cycles_raw)):
-        try:
-            c = cycles_raw[i]
-            # structured array에서 type 추출
-            ctype = _extract_str(c['type'])
-
-            # data 필드 unwrap
-            data = _unwrap(c['data'])
-
-            entry = {
-                'cycle_idx':    i,
-                'type':         ctype,
-                'capacity_ah':  None,
-                'internal_r':   None,
-                'voltage_mean': 0.0,
-                'current_mean': 0.0,
-                'temp_mean':    25.0,
-                'charge_time_s':0.0,
-            }
-
-            def get_arr(field):
-                try:
-                    return _extract_arr(data[field])
-                except Exception:
-                    return np.array([])
-
-            v  = get_arr('Voltage_measured')
-            a  = get_arr('Current_measured')
-            t  = get_arr('Temperature_measured')
-            ts = get_arr('Time')
-
-            if len(v)  > 0: entry['voltage_mean']  = float(np.mean(v))
-            if len(a)  > 0: entry['current_mean']  = float(np.mean(np.abs(a)))
-            if len(t)  > 0: entry['temp_mean']     = float(np.mean(t))
-            if len(ts) > 1: entry['charge_time_s'] = float(ts[-1] - ts[0])
-
-            if ctype == 'discharge':
-                cap = get_arr('Capacity')
-                if len(cap) > 0:
-                    entry['capacity_ah'] = float(cap.flat[-1])  # 마지막값 = 총 방전용량
-            if ctype == 'impedance':
-                re = get_arr('Re')
-                if len(re) > 0:
-                    entry['internal_r'] = float(re.flat[0])
-
-            results.append(entry)
-        except Exception:
-            continue
-    return results
-
-# 레거시 호환용 (미사용)
-def _parse_scipy_cycles(cycles_raw):
-    return []
 
 def _parse_hdf5_cycles(bat_group):
     import h5py
