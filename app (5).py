@@ -728,12 +728,10 @@ with st.sidebar:
     method = st.radio(
         "",
         ["⚡ EIS 기반 예측",
-         "📁 BMS CSV 업로드",
          "✏️ SOH 직접 입력",
          "🏭 배치 처리 (기업용)"],
         help=(
             "EIS: 임피던스 파일 업로드 (정밀) | "
-            "BMS CSV: 충방전 로그 파일 업로드 → SOH 예측 | "
             "배치: 여러 배터리 일괄 분석 (.mat / CSV) → 엑셀 다운로드"
         )
     )
@@ -843,164 +841,7 @@ if method == "⚡ EIS 기반 예측":
         """)
 
 # ─────────────────────────────────────────────
-# 모드 2: BMS CSV 업로드
-#
-# CSV 컬럼: cycle, voltage, current, temperature, time_s
-# capacity 컬럼 있으면 실측 SOH = 현재용량/초기용량×100
-# capacity 없으면 BMS ML 모델로 SOH 추정
-# ─────────────────────────────────────────────
-elif method == "📁 BMS CSV 업로드":
-    st.markdown("### 📁 BMS CSV 업로드")
-    st.caption(
-        "BMS 충방전 로그 CSV 업로드 → capacity 컬럼 있으면 실측 SOH, 없으면 ML 자동 추정\n"
-        "컬럼명이 달라도 키워드로 자동 매핑됩니다."
-    )
-
-    with st.expander("📄 권장 CSV 컬럼 형식 보기"):
-        st.markdown("""
-| 컬럼명 | 자동 감지 키워드 | 단위 |
-|---|---|---|
-| `cycle` | cycle, 사이클, cyc | 정수 |
-| `voltage` | voltage, volt, v, 전압 | V |
-| `current` | current, amp, i, 전류 | A |
-| `temperature` | temperature, temp, t, 온도 | °C |
-| `time_s` | time, t, 시간 | s |
-| `capacity` | capacity, 용량, cap | Ah (있으면 실측 SOH 계산) |
-
-> capacity 컬럼이 없으면 사이클·내부저항 기반 ML 모델로 SOH를 추정합니다.
-        """)
-        sample = pd.DataFrame({
-            'cycle':       [1, 1, 1, 2, 2, 2],
-            'voltage':     [3.2, 3.18, 3.15, 3.19, 3.17, 3.14],
-            'current':     [1.0, 1.0, -1.0, 1.0, 1.0, -1.0],
-            'temperature': [25.1, 25.3, 25.5, 25.2, 25.4, 25.6],
-            'capacity':    [0.0, 0.5, 2.0, 0.0, 0.49, 1.97],
-            'time_s':      [0, 1800, 3600, 0, 1800, 3600],
-        })
-        st.dataframe(sample, use_container_width=True)
-        st.download_button("⬇️ 샘플 CSV 다운로드",
-                           sample.to_csv(index=False),
-                           "bms_sample.csv", "text/csv")
-
-    bms_file = st.file_uploader("BMS 로그 CSV 업로드", type=['csv'])
-
-    if bms_file:
-        try:
-            df_bms = pd.read_csv(bms_file)
-
-            # 컬럼명 자동 매핑 (다양한 BMS 장비 포맷 대응)
-            col_map = {}
-            for col in df_bms.columns:
-                cl_name = col.lower()
-                if any(k in cl_name for k in ['cycle', 'cyc', '사이클']):
-                    col_map['cycle'] = col
-                elif any(k in cl_name for k in ['voltage', 'volt', '전압']):
-                    col_map['voltage'] = col
-                elif any(k in cl_name for k in ['current', 'amp', '전류']):
-                    col_map['current'] = col
-                elif any(k in cl_name for k in ['temp', '온도']):
-                    col_map['temperature'] = col
-                elif any(k in cl_name for k in ['time', '시간']):
-                    col_map['time_s'] = col
-                elif any(k in cl_name for k in ['capacity', '용량', 'cap']):
-                    col_map['capacity'] = col
-
-            if col_map:
-                st.caption(f"📌 컬럼 자동 매핑: {col_map}")
-            df_bms = df_bms.rename(columns={v: k for k, v in col_map.items()})
-
-            required = {'cycle', 'voltage', 'current', 'temperature', 'time_s'}
-            missing  = required - set(df_bms.columns)
-            if missing:
-                st.error(f"필수 컬럼을 찾지 못했습니다: {missing}")
-                st.info(f"감지된 컬럼: {list(df_bms.columns)}")
-            else:
-                # ── capacity 있으면 실측 SOH 계산 ──────────────
-                if 'capacity' in df_bms.columns:
-                    cap_per = df_bms.groupby('cycle')['capacity'].max()
-                    rated   = cap_per.iloc[0]
-                    soh_records_csv = [
-                        {'cycle': int(c), 'soh': round(cap / rated * 100, 2), 'capacity': float(cap)}
-                        for c, cap in cap_per.items()
-                    ]
-                    last_soh   = soh_records_csv[-1]['soh']
-                    last_cycle = soh_records_csv[-1]['cycle']
-                    soh_method = "실측 (방전 용량 기반)"
-
-                    # 사이클별 SOH 추이 그래프
-                    df_trend = pd.DataFrame(soh_records_csv)
-                    fig_trend = go.Figure()
-                    fig_trend.add_trace(go.Scatter(
-                        x=df_trend['cycle'], y=df_trend['soh'],
-                        mode='lines+markers', name='실측 SOH',
-                        line=dict(color='#00d4aa', width=2), marker=dict(size=4)
-                    ))
-                    fig_trend.add_hline(y=80, line_dash='dash', line_color='#f0a500',
-                                        annotation_text='SOH 80% 재사용 기준')
-                    fig_trend.add_hline(y=50, line_dash='dash', line_color='#e05555',
-                                        annotation_text='SOH 50% 해체 기준')
-                    fig_trend.update_layout(
-                        xaxis_title='사이클 수', yaxis_title='SOH (%)',
-                        template='plotly_dark', height=280,
-                        margin=dict(l=0, r=0, t=10, b=0)
-                    )
-                    st.plotly_chart(fig_trend, use_container_width=True)
-                    st.info(
-                        f"📌 총 {last_cycle}사이클 | "
-                        f"초기 용량 {rated:.3f} Ah → 현재 {soh_records_csv[-1]['capacity']:.3f} Ah | "
-                        f"실측 SOH **{last_soh:.1f}%**"
-                    )
-
-                # ── capacity 없으면 ML 추정 ─────────────────────
-                else:
-                    last_cycle = int(df_bms['cycle'].max())
-                    est_years  = round(last_cycle / 365.0, 1)
-
-                    # 내부저항 추정: dV/dI 기반
-                    dv = df_bms['voltage'].diff().abs().mean()
-                    di = df_bms['current'].diff().abs().mean()
-                    int_r = float(dv / di) if di > 0 else BAT_RESISTANCE[bat_type]['r0']
-                    int_r = float(np.clip(int_r,
-                                          BAT_RESISTANCE[bat_type]['r0'],
-                                          BAT_RESISTANCE[bat_type]['r_max'] * 1.3))
-
-                    last_soh   = predict_soh_bms(bms_models, bat_type,
-                                                  last_cycle, est_years, int_r)
-                    soh_method = f"ML 추정 (사이클 {last_cycle}회, 추정 내부저항 {int_r:.4f}Ω)"
-
-                    # 내부저항 추이
-                    r_trend = []
-                    for _, grp in df_bms.groupby('cycle'):
-                        dv_g = grp['voltage'].diff().abs().mean()
-                        di_g = grp['current'].diff().abs().mean()
-                        r_g  = float(dv_g / di_g) if di_g > 0 else BAT_RESISTANCE[bat_type]['r0']
-                        r_trend.append(float(np.clip(r_g, 0, 1.0)))
-                    fig_r = go.Figure()
-                    fig_r.add_trace(go.Scatter(
-                        y=r_trend, mode='lines+markers', name='내부 저항',
-                        line=dict(color='#f0a500', width=2), marker=dict(size=4)
-                    ))
-                    fig_r.update_layout(
-                        title="사이클별 내부 저항 추이 (Ω) — 노화 지표",
-                        xaxis_title="사이클", yaxis_title="내부 저항 (Ω)",
-                        template='plotly_dark', height=280,
-                        margin=dict(l=0, r=0, t=40, b=0)
-                    )
-                    st.plotly_chart(fig_r, use_container_width=True)
-
-                st.divider()
-                render_result(
-                    last_soh, f"BMS CSV — {soh_method}",
-                    bat_type, years, last_cycle, voltage, "📁 BMS CSV"
-                )
-
-        except Exception as e:
-            st.error(f"CSV 읽기 오류: {e}")
-    else:
-        st.info("👆 BMS 로그 CSV 파일을 업로드하면 분석이 시작됩니다.")
-
-# ─────────────────────────────────────────────
-# 모드 3: SOH 직접 입력
+# 모드 2: SOH 직접 입력
 # ─────────────────────────────────────────────
 elif method == "✏️ SOH 직접 입력":
     st.markdown("### ✏️ SOH 직접 입력")
@@ -1014,7 +855,7 @@ elif method == "✏️ SOH 직접 입력":
                       bat_type, years, cycles, voltage, "✏️ 직접 입력")
 
 # ─────────────────────────────────────────────
-# 모드 4: 배치 처리 (기업용)
+# 모드 3: 배치 처리 (기업용)
 # ─────────────────────────────────────────────
 elif method == "🏭 배치 처리 (기업용)":
     st.markdown("### 🏭 배치 처리 — 여러 배터리 일괄 분석")
